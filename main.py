@@ -2,10 +2,8 @@
 ProxyMaze'26 — Real-time Proxy Monitoring HTTP API
 Torch Labs Sri Lanka
 
-FINAL VERSION – Webhook delivery working, timestamp added, non‑blocking tasks.
-Scored 170/170 core + 100 bonus = 270 total in repeated internal tests.
+FINAL FIX – Race condition resolved, retry backoff shortened.
 """
-
 import asyncio
 import logging
 import os
@@ -35,7 +33,8 @@ ALERT_THRESHOLD = 0.20
 DEFAULT_CHECK_INTERVAL = 30
 DEFAULT_REQUEST_TIMEOUT = 5000
 PORT = int(os.environ.get("PORT", 7000))
-RETRY_DELAYS = [2, 4, 8, 16, 32]          # seconds
+# 🔧 Shortened retry delays to fit within 60 seconds (0 + 2 + 4 + 8 + 16 = 30s)
+RETRY_DELAYS = [2, 4, 8, 16]
 
 
 # ---------------------------------------------------------------------------
@@ -44,10 +43,8 @@ RETRY_DELAYS = [2, 4, 8, 16, 32]          # seconds
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
 def unix_epoch_int() -> int:
     return int(time.time())
-
 
 def proxy_id_from_url(url: str) -> str:
     return url.rstrip("/").split("/")[-1]
@@ -66,10 +63,9 @@ class AppState:
         self.proxies: Dict[str, Dict[str, Any]] = {}
         self.alerts: List[Dict[str, Any]] = []
         self.active_alert_id: Optional[str] = None
-        self.webhooks: Dict[str, str] = {}          # id -> url
+        self.webhooks: Dict[str, str] = {}
         self.integrations: List[Dict[str, Any]] = []
 
-        # Delivery dedup sets
         self.delivered_events: Set[Tuple[str, str, str]] = set()
         self.inflight_events: Set[Tuple[str, str, str]] = set()
 
@@ -137,6 +133,7 @@ async def run_monitor_cycle():
     if not snapshots:
         return
 
+    # Probe outside the lock
     tasks = {
         pid: asyncio.create_task(probe_proxy(snapshots[pid], timeout_ms))
         for pid in snapshots
@@ -150,6 +147,7 @@ async def run_monitor_cycle():
 
     checked_at = utcnow_iso()
 
+    # 🔧 Release the lock before calling alert handler
     async with state.lock:
         for pid, new_status in results.items():
             if pid not in state.proxies:
@@ -171,83 +169,86 @@ async def run_monitor_cycle():
                 p["history"] = p["history"][-1000:]
 
         failure_rate = state._compute_failure_rate()
-        await _handle_alert_state(failure_rate)
+
+    # 🔧 Alert handler is called **without** holding the lock
+    await _handle_alert_state(failure_rate)
 
 
 async def _handle_alert_state(failure_rate: float):
-    """Non‑blocking alert state machine. Schedules delivery tasks independently."""
-    if failure_rate >= ALERT_THRESHOLD:
-        if state.active_alert_id is not None:
-            # Update live fields of active alert
-            for alert in state.alerts:
-                if alert["alert_id"] == state.active_alert_id:
-                    alert["failed_proxy_ids"] = state._failed_proxy_ids()
-                    alert["failed_proxies"] = len(alert["failed_proxy_ids"])
-                    alert["failure_rate"] = round(failure_rate, 4)
-                    break
-            return
+    """Accesses state under its own lock when needed."""
+    async with state.lock:
+        if failure_rate >= ALERT_THRESHOLD:
+            if state.active_alert_id is not None:
+                for alert in state.alerts:
+                    if alert["alert_id"] == state.active_alert_id:
+                        alert["failed_proxy_ids"] = state._failed_proxy_ids()
+                        alert["failed_proxies"] = len(alert["failed_proxy_ids"])
+                        alert["failure_rate"] = round(failure_rate, 4)
+                        break
+                return
 
-        # Fire new alert
-        alert_id = f"alert-{uuid.uuid4().hex[:8]}"
-        snap = state._snapshot_alert_payload()
-        fired_at = utcnow_iso()
-        message = (
-            f"Failure rate {snap['failure_rate']:.0%} exceeds "
-            f"threshold {ALERT_THRESHOLD:.0%}. "
-            f"Failed proxies: {', '.join(snap['failed_proxy_ids']) or 'none'}."
-        )
-        alert = {
-            "alert_id": alert_id,
-            "status": "active",
-            "failure_rate": snap["failure_rate"],
-            "total_proxies": snap["total_proxies"],
-            "failed_proxies": snap["failed_proxies"],
-            "failed_proxy_ids": snap["failed_proxy_ids"],
-            "threshold": ALERT_THRESHOLD,
-            "fired_at": fired_at,
-            "resolved_at": None,
-            "message": message,
-        }
-        state.alerts.append(alert)
-        state.active_alert_id = alert_id
-        logger.info(f"Alert FIRED: {alert_id} failure_rate={failure_rate:.2%}")
+            alert_id = f"alert-{uuid.uuid4().hex[:8]}"
+            snap = state._snapshot_alert_payload()
+            fired_at = utcnow_iso()
+            message = (
+                f"Failure rate {snap['failure_rate']:.0%} exceeds "
+                f"threshold {ALERT_THRESHOLD:.0%}. "
+                f"Failed proxies: {', '.join(snap['failed_proxy_ids']) or 'none'}."
+            )
+            alert = {
+                "alert_id": alert_id,
+                "status": "active",
+                "failure_rate": snap["failure_rate"],
+                "total_proxies": snap["total_proxies"],
+                "failed_proxies": snap["failed_proxies"],
+                "failed_proxy_ids": snap["failed_proxy_ids"],
+                "threshold": ALERT_THRESHOLD,
+                "fired_at": fired_at,
+                "resolved_at": None,
+                "message": message,
+            }
+            state.alerts.append(alert)
+            state.active_alert_id = alert_id
+            logger.info(f"Alert FIRED: {alert_id} failure_rate={failure_rate:.2%}")
 
-        # Snapshot webhooks & integrations
-        webhooks_snap = dict(state.webhooks)
-        integrations_snap = list(state.integrations)
-
-        t = asyncio.create_task(
-            _deliver_alert_fired(alert_id, alert.copy(), webhooks_snap, integrations_snap)
-        )
-        state.background_tasks.add(t)
-        t.add_done_callback(state.background_tasks.discard)
-
-    else:
-        if state.active_alert_id is not None:
-            alert_id = state.active_alert_id
-            resolved_at = utcnow_iso()
-
-            resolved_alert = None
-            for alert in state.alerts:
-                if alert["alert_id"] == alert_id:
-                    alert["status"] = "resolved"
-                    alert["resolved_at"] = resolved_at
-                    resolved_alert = alert.copy()
-                    break
-
-            state.active_alert_id = None
-            logger.info(f"Alert RESOLVED: {alert_id} failure_rate={failure_rate:.2%}")
-
+            # 📸 Snapshot webhooks & integrations *while still inside the lock*
             webhooks_snap = dict(state.webhooks)
             integrations_snap = list(state.integrations)
 
+        else:
+            if state.active_alert_id is not None:
+                alert_id = state.active_alert_id
+                resolved_at = utcnow_iso()
+
+                resolved_alert = None
+                for alert in state.alerts:
+                    if alert["alert_id"] == alert_id:
+                        alert["status"] = "resolved"
+                        alert["resolved_at"] = resolved_at
+                        resolved_alert = alert.copy()
+                        break
+
+                state.active_alert_id = None
+                logger.info(f"Alert RESOLVED: {alert_id} failure_rate={failure_rate:.2%}")
+
+                webhooks_snap = dict(state.webhooks)
+                integrations_snap = list(state.integrations)
+            else:
+                # No active alert, nothing to deliver
+                return
+
+    # 🚀 Delivery tasks are created *outside* the lock to avoid blocking
+    if 'alert_id' in locals():
+        if failure_rate >= ALERT_THRESHOLD:
             t = asyncio.create_task(
-                _deliver_alert_resolved(
-                    alert_id, resolved_at, resolved_alert, webhooks_snap, integrations_snap
-                )
+                _deliver_alert_fired(alert_id, alert.copy(), webhooks_snap, integrations_snap)
             )
-            state.background_tasks.add(t)
-            t.add_done_callback(state.background_tasks.discard)
+        else:
+            t = asyncio.create_task(
+                _deliver_alert_resolved(alert_id, resolved_at, resolved_alert, webhooks_snap, integrations_snap)
+            )
+        state.background_tasks.add(t)
+        t.add_done_callback(state.background_tasks.discard)
 
 
 async def monitor_loop():
@@ -287,10 +288,10 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
     state.inflight_events.add(delivery_key)
     headers = {"Content-Type": "application/json"}
 
+    # Immediate first attempt (delay 0) + retries
     for attempt, delay in enumerate([0] + RETRY_DELAYS):
         if delay > 0:
             await asyncio.sleep(delay)
-        # Re-check if already delivered (another task might have succeeded)
         if delivery_key in state.delivered_events:
             state.inflight_events.discard(delivery_key)
             return
@@ -304,8 +305,7 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
                 state.inflight_events.discard(delivery_key)
                 return
             if resp.status_code in (429, 500, 502, 503, 504):
-                continue   # transient → retry
-            # Permanent error (4xx) – stop
+                continue
             break
         except Exception as e:
             logger.warning(f"Webhook attempt {attempt+1} to {url} failed: {e}")
@@ -325,7 +325,7 @@ async def _deliver_alert_fired(
         "alert_id": alert_id,
         "status": "active",
         "fired_at": alert["fired_at"],
-        "timestamp": alert["fired_at"],          # REQUIRED BY EVALUATOR
+        "timestamp": alert["fired_at"],
         "failure_rate": alert["failure_rate"],
         "total_proxies": alert["total_proxies"],
         "failed_proxies": alert["failed_proxies"],
@@ -343,10 +343,10 @@ async def _deliver_alert_fired(
         if "alert.fired" in integ.get("events", []):
             key = (alert_id, "alert.fired", integ["id"])
             if integ["type"] == "slack":
-                integ_payload = _build_slack_payload(alert, integ, fired=True)
+                payload = _build_slack_payload(alert, integ, fired=True)
             else:
-                integ_payload = _build_discord_payload(alert, integ, fired=True)
-            coros.append(_http_post_with_retry(integ["webhook_url"], integ_payload, key))
+                payload = _build_discord_payload(alert, integ, fired=True)
+            coros.append(_http_post_with_retry(integ["webhook_url"], payload, key))
 
     if coros:
         await asyncio.gather(*coros, return_exceptions=True)
@@ -364,7 +364,7 @@ async def _deliver_alert_resolved(
         "alert_id": alert_id,
         "status": "resolved",
         "resolved_at": resolved_at,
-        "timestamp": resolved_at,                # REQUIRED BY EVALUATOR
+        "timestamp": resolved_at,
     }
     if alert:
         resolved_payload.update({
@@ -386,19 +386,19 @@ async def _deliver_alert_resolved(
             key = (alert_id, "alert.resolved", integ["id"])
             if alert:
                 if integ["type"] == "slack":
-                    integ_payload = _build_slack_payload(alert, integ, fired=False)
+                    payload = _build_slack_payload(alert, integ, fired=False)
                 else:
-                    integ_payload = _build_discord_payload(alert, integ, fired=False)
+                    payload = _build_discord_payload(alert, integ, fired=False)
             else:
-                integ_payload = resolved_payload
-            coros.append(_http_post_with_retry(integ["webhook_url"], integ_payload, key))
+                payload = resolved_payload
+            coros.append(_http_post_with_retry(integ["webhook_url"], payload, key))
 
     if coros:
         await asyncio.gather(*coros, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
-# Slack & Discord payload builders
+# Slack & Discord payload builders (unchanged)
 # ---------------------------------------------------------------------------
 def _build_slack_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
     color = "#FF0000" if fired else "#36A64F"
@@ -488,17 +488,15 @@ app = FastAPI(
 
 
 # ---------------------------------------------------------------------------
-# Endpoints (identical to the 170‑point version)
+# Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-
 @app.get("/health/{proxy_id}")
 async def health_proxy(proxy_id: str):
     return {"status": "ok"}
-
 
 @app.get("/fail/{proxy_id}")
 async def fail_endpoint(proxy_id: str):
