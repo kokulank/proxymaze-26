@@ -295,19 +295,23 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
             state.inflight_events.discard(delivery_key)
             return
         try:
-            async with httpx.AsyncClient(timeout=30.0, verify=False, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
                 resp = await client.post(url, json=payload, headers=headers)
             logger.info(f"Webhook POST {url} -> {resp.status_code} (attempt {attempt+1})")
             # Retry only on 5xx transient errors
+            if 200 <= resp.status_code < 300:
+                state.delivered_events.add(delivery_key)
+                state.webhook_deliveries += 1
+                state.inflight_events.discard(delivery_key)
+                logger.info(f"Webhook delivered to {url} (HTTP {resp.status_code})")
+                return
             if resp.status_code in (429, 500, 502, 503, 504):
                 logger.warning(f"Webhook {url} got {resp.status_code}, will retry")
                 continue
-            # ANY other response (2xx, 3xx, 4xx) = capture server received it
-            state.delivered_events.add(delivery_key)
-            state.webhook_deliveries += 1
-            state.inflight_events.discard(delivery_key)
-            logger.info(f"Webhook delivered to {url} (HTTP {resp.status_code})")
-            return
+            
+            # 4xx means bad payload or unauthorized, don't retry but don't count as success
+            logger.error(f"Webhook rejected by {url} (HTTP {resp.status_code})")
+            break
         except Exception as e:
             logger.warning(f"Webhook attempt {attempt+1} to {url} failed: {e}")
 
@@ -326,7 +330,7 @@ async def _deliver_alert_fired(
         "alert_id": alert_id,
         "status": "active",
         "fired_at": alert["fired_at"],
-        "timestamp": alert["fired_at"],          # ✅ ADDED – was missing before
+        "timestamp": unix_epoch_int(),
         "failure_rate": alert["failure_rate"],
         "total_proxies": alert["total_proxies"],
         "failed_proxies": alert["failed_proxies"],
@@ -365,7 +369,7 @@ async def _deliver_alert_resolved(
         "alert_id": alert_id,
         "status": "resolved",
         "resolved_at": resolved_at,
-        "timestamp": resolved_at,                # ✅ ADDED – was missing before
+        "timestamp": unix_epoch_int(),
     }
     if alert:
         resolved_payload.update({
