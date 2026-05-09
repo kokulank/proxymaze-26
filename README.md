@@ -52,6 +52,16 @@ $env:PORT=9090; python main.py
 | GET | `/metrics` | Get operational metrics |
 | GET | `/docs` | Interactive Swagger UI (auto-generated) |
 
+## Manual Testing (Swagger UI)
+
+The easiest way to manually test the API is using the built-in Interactive Swagger Documentation:
+
+1. Open **[https://proxymaze-26.onrender.com/docs](https://proxymaze-26.onrender.com/docs)** in your web browser.
+2. Click on any endpoint (like `POST /proxies` or `GET /alerts`).
+3. Click the **"Try it out"** button.
+4. Fill in any required JSON body (e.g., adding proxy URLs) and click **"Execute"**.
+5. You'll see the exact response, status code, and data instantly!
+
 ## Key Behaviours
 
 - **Proxy IDs** extracted from last URL path segment
