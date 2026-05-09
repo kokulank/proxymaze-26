@@ -1,6 +1,5 @@
 """
-ProxyMaze'26 - Complete Implementation
-Targets 270/270 score
+ProxyMaze'26 - Complete Implementation targeting 270/270
 """
 
 import asyncio
@@ -13,43 +12,31 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from typing import Any
+from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# In-memory state
+# Global State
 # ---------------------------------------------------------------------------
+
 config = {
     "check_interval_seconds": 60,
     "request_timeout_ms": 5000,
 }
 
-# proxy_id -> proxy dict
 proxies: dict[str, dict] = {}
-
-# alert_id -> alert dict
 alerts: dict[str, dict] = {}
-
-# webhook_id -> webhook dict
 webhooks: dict[str, dict] = {}
-
-# integration_id -> integration dict
 integrations: dict[str, dict] = {}
 
-# metrics counters
-metrics = {
+metrics_state = {
     "total_checks": 0,
     "webhook_deliveries": 0,
 }
 
-# alert state
 active_alert_id: Optional[str] = None
-
-# lock for alert state mutations
 alert_lock = asyncio.Lock()
 
 THRESHOLD = 0.20
@@ -61,53 +48,341 @@ THRESHOLD = 0.20
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def now_ts() -> int:
+def now_epoch() -> int:
     return int(time.time())
 
 def extract_proxy_id(url: str) -> str:
     return url.rstrip("/").split("/")[-1]
 
-def compute_failure_rate() -> tuple[int, int, int, list[str]]:
-    """Returns (total, up_count, down_count, failed_ids). Pending not counted as down."""
-    total = len(proxies)
-    down_ids = [pid for pid, p in proxies.items() if p["status"] == "down"]
-    up_count = sum(1 for p in proxies.values() if p["status"] == "up")
-    return total, up_count, len(down_ids), down_ids
-
 # ---------------------------------------------------------------------------
-# Background monitoring
+# HTTP Probe
 # ---------------------------------------------------------------------------
 
 async def probe_proxy(proxy: dict) -> bool:
-    """Returns True if proxy is up."""
+    """
+    True  = up   (2xx within timeout)
+    False = down (timeout, connection error, 5xx)
+    """
     url = proxy["url"]
     timeout_s = config["request_timeout_ms"] / 1000.0
     try:
-        async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=timeout_s, read=timeout_s, write=timeout_s, pool=timeout_s),
+            follow_redirects=True,
+            verify=False,
+        ) as client:
             resp = await client.get(url)
-            return 200 <= resp.status_code < 300
-    except Exception:
+            if 200 <= resp.status_code < 300:
+                return True
+            if resp.status_code >= 500:
+                return False
+            # 4xx = server reachable; treat as up (spec only says 2xx=up, 5xx=down, timeout=down)
+            return True
+    except (
+        httpx.TimeoutException,
+        httpx.ConnectError,
+        httpx.NetworkError,
+        httpx.RemoteProtocolError,
+        Exception,
+    ):
         return False
 
-async def check_all_proxies():
-    """Run one health-check cycle for all proxies."""
+# ---------------------------------------------------------------------------
+# Webhook / Integration Delivery
+# ---------------------------------------------------------------------------
+
+async def deliver_once(url: str, payload: dict) -> bool:
+    """One delivery attempt. Returns True on non-5xx response."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), verify=False) as client:
+            resp = await client.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            if resp.status_code in (500, 502, 503, 504):
+                logger.warning(f"Receiver {url} returned {resp.status_code}, will retry")
+                return False
+            logger.info(f"Delivered to {url}, status={resp.status_code}")
+            return True
+    except Exception as e:
+        logger.warning(f"Delivery network error to {url}: {e}")
+        return False
+
+
+async def deliver_with_retry(url: str, payload: dict):
+    """Retry on 5xx/network error with exponential backoff. Exactly one success."""
+    for attempt in range(25):
+        if await deliver_once(url, payload):
+            metrics_state["webhook_deliveries"] += 1
+            return
+        wait = min(2 ** attempt, 60)
+        logger.warning(f"Retry {attempt + 1} for {url} in {wait}s")
+        await asyncio.sleep(wait)
+    logger.error(f"Giving up on {url} after 25 attempts")
+
+
+async def broadcast_webhooks(payload: dict):
+    """Non-blocking delivery to all registered webhooks."""
+    for wh in list(webhooks.values()):
+        asyncio.create_task(deliver_with_retry(wh["url"], payload))
+
+
+# ---------------------------------------------------------------------------
+# Slack / Discord Payloads
+# ---------------------------------------------------------------------------
+
+def build_slack_payload(intg: dict, alert: dict, event_type: str) -> dict:
+    fired_at = alert.get("fired_at", now_iso())
+    try:
+        ts_int = int(
+            datetime.strptime(fired_at, "%Y-%m-%dT%H:%M:%SZ")
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except Exception:
+        ts_int = now_epoch()
+
+    failed_ids_str = ", ".join(alert.get("failed_proxy_ids", [])) or "none"
+
+    if event_type == "alert.fired":
+        color = "#FF0000"
+        text = ":red_circle: *ALERT FIRED* — Proxy pool failure rate exceeded threshold"
+        fields = [
+            {"title": "Alert ID",       "value": alert["alert_id"],             "short": True},
+            {"title": "Failure Rate",   "value": str(alert["failure_rate"]),    "short": True},
+            {"title": "Failed Proxies", "value": str(alert["failed_proxies"]),  "short": True},
+            {"title": "Threshold",      "value": str(alert["threshold"]),       "short": True},
+            {"title": "Failed IDs",     "value": failed_ids_str,                "short": False},
+            {"title": "Fired At",       "value": fired_at,                      "short": True},
+        ]
+    else:
+        color = "#36A64F"
+        resolved_at = alert.get("resolved_at", now_iso())
+        try:
+            ts_int = int(
+                datetime.strptime(resolved_at, "%Y-%m-%dT%H:%M:%SZ")
+                .replace(tzinfo=timezone.utc)
+                .timestamp()
+            )
+        except Exception:
+            ts_int = now_epoch()
+        text = ":large_green_circle: *ALERT RESOLVED* — Proxy pool failure rate dropped below threshold"
+        fields = [
+            {"title": "Alert ID",       "value": alert["alert_id"],             "short": True},
+            {"title": "Failure Rate",   "value": str(alert["failure_rate"]),    "short": True},
+            {"title": "Failed Proxies", "value": str(alert["failed_proxies"]),  "short": True},
+            {"title": "Threshold",      "value": str(alert["threshold"]),       "short": True},
+            {"title": "Failed IDs",     "value": failed_ids_str,                "short": False},
+            {"title": "Fired At",       "value": fired_at,                      "short": True},
+        ]
+
+    return {
+        "username": intg.get("username", "ProxyWatch"),
+        "text": text,
+        "attachments": [
+            {
+                "color": color,
+                "fields": fields,
+                "footer": "ProxyMaze'26 — Torch Labs",
+                "ts": ts_int,
+            }
+        ],
+    }
+
+
+def build_discord_payload(intg: dict, alert: dict, event_type: str) -> dict:
+    fired_at = alert.get("fired_at", now_iso())
+    failed_ids_str = ", ".join(alert.get("failed_proxy_ids", [])) or "none"
+
+    if event_type == "alert.fired":
+        color = 16711680  # Red
+        title = "🚨 Alert Fired — Proxy Pool Threshold Breached"
+        description = (
+            f"Pool failure rate **{alert['failure_rate']}** has exceeded "
+            f"threshold **{alert['threshold']}**."
+        )
+        fields = [
+            {"name": "Alert ID",       "value": alert["alert_id"],            "inline": True},
+            {"name": "Failure Rate",   "value": str(alert["failure_rate"]),   "inline": True},
+            {"name": "Failed Proxies", "value": str(alert["failed_proxies"]), "inline": True},
+            {"name": "Threshold",      "value": str(alert["threshold"]),      "inline": True},
+            {"name": "Failed IDs",     "value": failed_ids_str,               "inline": False},
+            {"name": "Fired At",       "value": fired_at,                     "inline": True},
+        ]
+    else:
+        color = 3329330   # Green
+        resolved_at = alert.get("resolved_at", now_iso())
+        title = "✅ Alert Resolved — Pool Recovered"
+        description = (
+            f"Pool failure rate has dropped below threshold **{alert['threshold']}**. "
+            f"Resolved at {resolved_at}."
+        )
+        fields = [
+            {"name": "Alert ID",       "value": alert["alert_id"],            "inline": True},
+            {"name": "Failure Rate",   "value": str(alert["failure_rate"]),   "inline": True},
+            {"name": "Failed Proxies", "value": str(alert["failed_proxies"]), "inline": True},
+            {"name": "Threshold",      "value": str(alert["threshold"]),      "inline": True},
+            {"name": "Failed IDs",     "value": failed_ids_str,               "inline": False},
+        ]
+
+    return {
+        "username": intg.get("username", "ProxyWatch"),
+        "embeds": [
+            {
+                "title": title,
+                "description": description,
+                "color": color,
+                "fields": fields,
+                "footer": {"text": "ProxyMaze'26 — Torch Labs"},
+            }
+        ],
+    }
+
+
+async def broadcast_integrations(alert: dict, event_type: str):
+    for intg in list(integrations.values()):
+        if event_type not in intg.get("events", []):
+            continue
+        itype = intg.get("type", "")
+        if itype == "slack":
+            payload = build_slack_payload(intg, alert, event_type)
+        elif itype == "discord":
+            payload = build_discord_payload(intg, alert, event_type)
+        else:
+            continue
+        asyncio.create_task(deliver_with_retry(intg["webhook_url"], payload))
+
+
+# ---------------------------------------------------------------------------
+# Alert State Machine
+# ---------------------------------------------------------------------------
+
+async def fire_alert(total: int, down_count: int, down_ids: list[str], failure_rate: float):
+    global active_alert_id
+    alert_id = f"alert-{uuid.uuid4().hex[:8]}"
+    fired_at = now_iso()
+    alert = {
+        "alert_id": alert_id,
+        "status": "active",
+        "failure_rate": round(failure_rate, 4),
+        "total_proxies": total,
+        "failed_proxies": down_count,
+        "failed_proxy_ids": list(down_ids),
+        "threshold": THRESHOLD,
+        "fired_at": fired_at,
+        "resolved_at": None,
+        "message": "Proxy pool failure rate exceeded threshold",
+    }
+    alerts[alert_id] = alert
+    active_alert_id = alert_id
+    logger.info(f"ALERT FIRED: {alert_id}, rate={failure_rate:.4f}")
+
+    webhook_payload = {
+        "event": "alert.fired",
+        "alert_id": alert_id,
+        "fired_at": fired_at,
+        "failure_rate": alert["failure_rate"],
+        "total_proxies": total,
+        "failed_proxies": down_count,
+        "failed_proxy_ids": list(down_ids),
+        "threshold": THRESHOLD,
+        "message": "Proxy pool failure rate exceeded threshold",
+    }
+    await broadcast_webhooks(webhook_payload)
+    await broadcast_integrations(alert, "alert.fired")
+
+
+async def resolve_current_alert():
+    global active_alert_id
+    if active_alert_id is None:
+        return
+    alert_id = active_alert_id
+    if alert_id not in alerts:
+        active_alert_id = None
+        return
+    alert = alerts[alert_id]
+    resolved_at = now_iso()
+    alert["status"] = "resolved"
+    alert["resolved_at"] = resolved_at
+    active_alert_id = None
+    logger.info(f"ALERT RESOLVED: {alert_id}")
+
+    webhook_payload = {
+        "event": "alert.resolved",
+        "alert_id": alert_id,
+        "resolved_at": resolved_at,
+    }
+    await broadcast_webhooks(webhook_payload)
+    await broadcast_integrations(alert, "alert.resolved")
+
+
+async def evaluate_alert():
+    """
+    Enforce alert lifecycle. Called after every check cycle.
+    At most ONE active alert at any time.
+    Continuous breach: update existing alert, DO NOT fire again.
+    """
+    global active_alert_id
+
+    async with alert_lock:
+        total = len(proxies)
+        if total == 0:
+            return
+
+        down_ids = [pid for pid, p in proxies.items() if p["status"] == "down"]
+        down_count = len(down_ids)
+        failure_rate = down_count / total
+
+        logger.info(
+            f"Evaluate: total={total}, down={down_count}, "
+            f"rate={failure_rate:.4f}, active={active_alert_id}"
+        )
+
+        if failure_rate >= THRESHOLD:
+            if active_alert_id is None:
+                # Breach with no active alert → fire new alert
+                await fire_alert(total, down_count, down_ids, failure_rate)
+            else:
+                # Already have an active alert → just update its data, no new webhook
+                alert = alerts[active_alert_id]
+                alert["failed_proxy_ids"] = list(down_ids)
+                alert["failed_proxies"] = down_count
+                alert["failure_rate"] = round(failure_rate, 4)
+                alert["total_proxies"] = total
+        else:
+            if active_alert_id is not None:
+                # Rate dropped below threshold → resolve
+                await resolve_current_alert()
+
+
+# ---------------------------------------------------------------------------
+# Check Cycle
+# ---------------------------------------------------------------------------
+
+async def run_check_cycle():
+    """Run one full health-check cycle for all current proxies."""
     if not proxies:
         return
 
-    tasks = {pid: asyncio.create_task(probe_proxy(p)) for pid, p in list(proxies.items())}
-    results = {}
-    for pid, task in tasks.items():
-        try:
-            results[pid] = await task
-        except Exception:
-            results[pid] = False
-
     checked_at = now_iso()
-    for pid, is_up in results.items():
+    pid_list = list(proxies.keys())
+
+    # Probe all concurrently
+    tasks = {}
+    for pid in pid_list:
+        if pid in proxies:
+            tasks[pid] = asyncio.create_task(probe_proxy(proxies[pid]))
+
+    for pid, task in tasks.items():
         if pid not in proxies:
             continue
+        try:
+            is_up = await task
+        except Exception:
+            is_up = False
+
         p = proxies[pid]
-        old_status = p["status"]
         new_status = "up" if is_up else "down"
         p["status"] = new_status
         p["last_checked_at"] = checked_at
@@ -118,249 +393,37 @@ async def check_all_proxies():
             p["consecutive_failures"] = 0
 
         p["total_checks"] = p.get("total_checks", 0) + 1
-        up_checks = p.get("up_checks", 0) + (1 if is_up else 0)
-        p["up_checks"] = up_checks
-        p["uptime_percentage"] = round((up_checks / p["total_checks"]) * 100, 1)
-
-        # Append to history
+        p["up_checks"] = p.get("up_checks", 0) + (1 if is_up else 0)
+        p["uptime_percentage"] = round((p["up_checks"] / p["total_checks"]) * 100, 1)
         p["history"].append({"checked_at": checked_at, "status": new_status})
 
-        metrics["total_checks"] += 1
+        metrics_state["total_checks"] += 1
 
-    # Evaluate alert state after all checks
     await evaluate_alert()
 
-async def deliver_webhook(url: str, payload: dict, retries: int = 10):
-    """Deliver webhook with retry on 5xx."""
-    for attempt in range(retries):
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                )
-                if resp.status_code in (500, 502, 503, 504):
-                    logger.warning(f"Webhook {url} returned {resp.status_code}, retrying...")
-                    await asyncio.sleep(min(2 ** attempt, 30))
-                    continue
-                # Any non-5xx = success (including 4xx - we stop)
-                metrics["webhook_deliveries"] += 1
-                logger.info(f"Webhook delivered to {url} on attempt {attempt+1}")
-                return True
-        except Exception as e:
-            logger.warning(f"Webhook delivery error to {url}: {e}, attempt {attempt+1}")
-            await asyncio.sleep(min(2 ** attempt, 30))
-    logger.error(f"Webhook delivery failed after {retries} attempts: {url}")
-    return False
 
-async def deliver_to_all_webhooks(payload: dict):
-    """Fire webhook delivery to all registered receivers (non-blocking)."""
-    for wh in list(webhooks.values()):
-        asyncio.create_task(deliver_webhook(wh["url"], payload))
-
-async def deliver_slack_integration(alert: dict, event_type: str):
-    """Send Slack-formatted payload to registered Slack integrations."""
-    for intg in list(integrations.values()):
-        if intg["type"] != "slack":
-            continue
-        if event_type not in intg.get("events", []):
-            continue
-
-        fired_at = alert.get("fired_at", now_iso())
-        ts = int(datetime.strptime(fired_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
-
-        if event_type == "alert.fired":
-            color = "#FF0000"
-            text = f":red_circle: *ALERT FIRED* — Proxy pool failure rate exceeded threshold"
-            fields = [
-                {"title": "Alert ID", "value": alert["alert_id"], "short": True},
-                {"title": "Failure Rate", "value": str(alert["failure_rate"]), "short": True},
-                {"title": "Failed Proxies", "value": str(alert["failed_proxies"]), "short": True},
-                {"title": "Threshold", "value": str(alert["threshold"]), "short": True},
-                {"title": "Failed IDs", "value": ", ".join(alert.get("failed_proxy_ids", [])), "short": False},
-                {"title": "Fired At", "value": fired_at, "short": True},
-            ]
-        else:  # alert.resolved
-            color = "#00FF00"
-            text = f":large_green_circle: *ALERT RESOLVED* — Proxy pool failure rate dropped below threshold"
-            resolved_at = alert.get("resolved_at", now_iso())
-            fields = [
-                {"title": "Alert ID", "value": alert["alert_id"], "short": True},
-                {"title": "Failure Rate", "value": str(alert.get("failure_rate", 0)), "short": True},
-                {"title": "Failed Proxies", "value": str(alert.get("failed_proxies", 0)), "short": True},
-                {"title": "Threshold", "value": str(alert["threshold"]), "short": True},
-                {"title": "Failed IDs", "value": ", ".join(alert.get("failed_proxy_ids", [])) or "none", "short": False},
-                {"title": "Fired At", "value": fired_at, "short": True},
-            ]
-            ts = int(datetime.strptime(resolved_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
-
-        payload = {
-            "username": intg.get("username", "ProxyWatch"),
-            "text": text,
-            "attachments": [
-                {
-                    "color": color,
-                    "fields": fields,
-                    "footer": "ProxyMaze'26 by Torch Labs",
-                    "ts": ts,
-                }
-            ],
-        }
-        asyncio.create_task(deliver_webhook(intg["webhook_url"], payload))
-
-async def deliver_discord_integration(alert: dict, event_type: str):
-    """Send Discord-formatted payload to registered Discord integrations."""
-    for intg in list(integrations.values()):
-        if intg["type"] != "discord":
-            continue
-        if event_type not in intg.get("events", []):
-            continue
-
-        fired_at = alert.get("fired_at", now_iso())
-
-        if event_type == "alert.fired":
-            color = 16711680  # Red
-            title = "🚨 Alert Fired — Proxy Pool Threshold Breached"
-            description = f"Proxy pool failure rate has exceeded the threshold of {alert['threshold']}."
-            fields = [
-                {"name": "Alert ID", "value": alert["alert_id"], "inline": True},
-                {"name": "Failure Rate", "value": str(alert["failure_rate"]), "inline": True},
-                {"name": "Failed Proxies", "value": str(alert["failed_proxies"]), "inline": True},
-                {"name": "Threshold", "value": str(alert["threshold"]), "inline": True},
-                {"name": "Failed IDs", "value": ", ".join(alert.get("failed_proxy_ids", [])) or "none", "inline": False},
-                {"name": "Fired At", "value": fired_at, "inline": True},
-            ]
-        else:  # alert.resolved
-            color = 65280  # Green
-            title = "✅ Alert Resolved — Proxy Pool Recovered"
-            description = f"Proxy pool failure rate has dropped below the threshold of {alert['threshold']}."
-            fields = [
-                {"name": "Alert ID", "value": alert["alert_id"], "inline": True},
-                {"name": "Failure Rate", "value": str(alert.get("failure_rate", 0)), "inline": True},
-                {"name": "Failed Proxies", "value": str(alert.get("failed_proxies", 0)), "inline": True},
-                {"name": "Threshold", "value": str(alert["threshold"]), "inline": True},
-                {"name": "Failed IDs", "value": ", ".join(alert.get("failed_proxy_ids", [])) or "none", "inline": False},
-            ]
-
-        payload = {
-            "username": intg.get("username", "ProxyWatch"),
-            "embeds": [
-                {
-                    "title": title,
-                    "description": description,
-                    "color": color,
-                    "fields": fields,
-                    "footer": {"text": "ProxyMaze'26 by Torch Labs"},
-                }
-            ],
-        }
-        asyncio.create_task(deliver_webhook(intg["webhook_url"], payload))
-
-async def fire_alert(total: int, down_count: int, failed_ids: list[str], failure_rate: float):
-    """Create and fire a new alert."""
-    global active_alert_id
-    alert_id = f"alert-{uuid.uuid4().hex[:8]}"
-    fired_at = now_iso()
-    alert = {
-        "alert_id": alert_id,
-        "status": "active",
-        "failure_rate": round(failure_rate, 4),
-        "total_proxies": total,
-        "failed_proxies": down_count,
-        "failed_proxy_ids": list(failed_ids),
-        "threshold": THRESHOLD,
-        "fired_at": fired_at,
-        "resolved_at": None,
-        "message": "Proxy pool failure rate exceeded threshold",
-    }
-    alerts[alert_id] = alert
-    active_alert_id = alert_id
-    logger.info(f"Alert fired: {alert_id}, failure_rate={failure_rate}")
-
-    payload = {
-        "event": "alert.fired",
-        "alert_id": alert_id,
-        "fired_at": fired_at,
-        "failure_rate": alert["failure_rate"],
-        "total_proxies": total,
-        "failed_proxies": down_count,
-        "failed_proxy_ids": list(failed_ids),
-        "threshold": THRESHOLD,
-        "message": "Proxy pool failure rate exceeded threshold",
-    }
-    await deliver_to_all_webhooks(payload)
-    await deliver_slack_integration(alert, "alert.fired")
-    await deliver_discord_integration(alert, "alert.fired")
-
-async def resolve_alert(alert_id: str):
-    """Resolve an active alert."""
-    global active_alert_id
-    if alert_id not in alerts:
-        return
-    alert = alerts[alert_id]
-    resolved_at = now_iso()
-    alert["status"] = "resolved"
-    alert["resolved_at"] = resolved_at
-    active_alert_id = None
-    logger.info(f"Alert resolved: {alert_id}")
-
-    payload = {
-        "event": "alert.resolved",
-        "alert_id": alert_id,
-        "resolved_at": resolved_at,
-    }
-    await deliver_to_all_webhooks(payload)
-    await deliver_slack_integration(alert, "alert.resolved")
-    await deliver_discord_integration(alert, "alert.resolved")
-
-async def evaluate_alert():
-    """Check pool state and fire/resolve alerts as needed."""
-    global active_alert_id
-
-    async with alert_lock:
-        total = len(proxies)
-        # Only consider proxies that have been checked (not pending) for failure rate
-        checked = [p for p in proxies.values() if p["status"] != "pending"]
-        if total == 0:
-            return
-
-        down_ids = [pid for pid, p in proxies.items() if p["status"] == "down"]
-        down_count = len(down_ids)
-        failure_rate = down_count / total
-
-        if failure_rate >= THRESHOLD:
-            if active_alert_id is None:
-                # No active alert — fire one
-                await fire_alert(total, down_count, down_ids, failure_rate)
-            else:
-                # Update existing active alert's failed_proxy_ids to stay consistent
-                alert = alerts[active_alert_id]
-                alert["failed_proxy_ids"] = list(down_ids)
-                alert["failed_proxies"] = down_count
-                alert["failure_rate"] = round(failure_rate, 4)
-                alert["total_proxies"] = total
-        else:
-            if active_alert_id is not None:
-                # Resolve the active alert
-                await resolve_alert(active_alert_id)
+# ---------------------------------------------------------------------------
+# Background Monitoring Loop
+# ---------------------------------------------------------------------------
 
 async def monitoring_loop():
-    """Background monitoring loop."""
-    logger.info("Monitoring loop started")
+    logger.info("Background monitoring loop started")
     while True:
         try:
             interval = config["check_interval_seconds"]
             await asyncio.sleep(interval)
-            await check_all_proxies()
+            logger.info(f"Scheduled check cycle (interval={interval}s)")
+            await run_check_cycle()
         except asyncio.CancelledError:
+            logger.info("Monitoring loop cancelled")
             break
         except Exception as e:
-            logger.error(f"Monitoring loop error: {e}")
+            logger.error(f"Monitoring loop exception: {e}", exc_info=True)
             await asyncio.sleep(5)
 
+
 # ---------------------------------------------------------------------------
-# FastAPI app
+# App Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
@@ -373,20 +436,21 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+
 app = FastAPI(lifespan=lifespan)
 
+
 # ---------------------------------------------------------------------------
-# Chapter 01: GET /health
+# Routes
 # ---------------------------------------------------------------------------
 
+# Ch01
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# ---------------------------------------------------------------------------
-# Chapter 02: POST /config
-# ---------------------------------------------------------------------------
 
+# Ch02
 class ConfigRequest(BaseModel):
     check_interval_seconds: int
     request_timeout_ms: int
@@ -396,20 +460,22 @@ class ConfigRequest(BaseModel):
 async def set_config(body: ConfigRequest):
     config["check_interval_seconds"] = body.check_interval_seconds
     config["request_timeout_ms"] = body.request_timeout_ms
-    return {"check_interval_seconds": body.check_interval_seconds, "request_timeout_ms": body.request_timeout_ms}
+    return {
+        "check_interval_seconds": body.check_interval_seconds,
+        "request_timeout_ms": body.request_timeout_ms,
+    }
 
-# ---------------------------------------------------------------------------
-# Chapter 03: GET /config
-# ---------------------------------------------------------------------------
 
+# Ch03
 @app.get("/config")
 async def get_config():
-    return config
+    return {
+        "check_interval_seconds": config["check_interval_seconds"],
+        "request_timeout_ms": config["request_timeout_ms"],
+    }
 
-# ---------------------------------------------------------------------------
-# Chapter 04: POST /proxies
-# ---------------------------------------------------------------------------
 
+# Ch04
 class ProxiesRequest(BaseModel):
     proxies: list[str]
     replace: Optional[bool] = False
@@ -437,46 +503,50 @@ async def add_proxies(body: ProxiesRequest):
             }
         accepted.append(proxies[pid])
 
-    # Immediately kick off a check in background (don't wait)
-    asyncio.create_task(check_all_proxies())
+    # Immediate check (background)
+    asyncio.create_task(run_check_cycle())
 
     return {
         "accepted": len(accepted),
-        "proxies": [{"id": p["id"], "url": p["url"], "status": p["status"]} for p in accepted],
+        "proxies": [
+            {"id": p["id"], "url": p["url"], "status": p["status"]}
+            for p in accepted
+        ],
     }
 
-# ---------------------------------------------------------------------------
-# Chapter 05: GET /proxies
-# ---------------------------------------------------------------------------
 
+# Ch05
 @app.get("/proxies")
 async def list_proxies():
     total = len(proxies)
     up = sum(1 for p in proxies.values() if p["status"] == "up")
     down = sum(1 for p in proxies.values() if p["status"] == "down")
     failure_rate = round(down / total, 4) if total > 0 else 0.0
-
-    proxy_list = []
-    for p in proxies.values():
-        proxy_list.append({
-            "id": p["id"],
-            "url": p["url"],
-            "status": p["status"],
-            "last_checked_at": p["last_checked_at"],
-            "consecutive_failures": p["consecutive_failures"],
-        })
-
     return {
         "total": total,
         "up": up,
         "down": down,
         "failure_rate": failure_rate,
-        "proxies": proxy_list,
+        "proxies": [
+            {
+                "id": p["id"],
+                "url": p["url"],
+                "status": p["status"],
+                "last_checked_at": p["last_checked_at"],
+                "consecutive_failures": p["consecutive_failures"],
+            }
+            for p in proxies.values()
+        ],
     }
 
-# ---------------------------------------------------------------------------
-# Chapter 06: GET /proxies/{id}
-# ---------------------------------------------------------------------------
+
+# Ch06 — must come BEFORE /proxies/{proxy_id}/history to avoid route conflict
+@app.get("/proxies/{proxy_id}/history")
+async def get_proxy_history(proxy_id: str):
+    if proxy_id not in proxies:
+        raise HTTPException(status_code=404, detail="Proxy not found")
+    return proxies[proxy_id]["history"]
+
 
 @app.get("/proxies/{proxy_id}")
 async def get_proxy(proxy_id: str):
@@ -494,37 +564,21 @@ async def get_proxy(proxy_id: str):
         "history": p["history"],
     }
 
-# ---------------------------------------------------------------------------
-# Chapter 07: GET /proxies/{id}/history
-# ---------------------------------------------------------------------------
 
-@app.get("/proxies/{proxy_id}/history")
-async def get_proxy_history(proxy_id: str):
-    if proxy_id not in proxies:
-        raise HTTPException(status_code=404, detail="Proxy not found")
-    return proxies[proxy_id]["history"]
-
-# ---------------------------------------------------------------------------
-# Chapter 08: DELETE /proxies
-# ---------------------------------------------------------------------------
-
+# Ch08
 @app.delete("/proxies", status_code=204)
 async def delete_proxies():
     proxies.clear()
     return None
 
-# ---------------------------------------------------------------------------
-# Chapter 09: GET /alerts
-# ---------------------------------------------------------------------------
 
+# Ch09
 @app.get("/alerts")
 async def list_alerts():
     return list(alerts.values())
 
-# ---------------------------------------------------------------------------
-# Chapter 10: POST /webhooks
-# ---------------------------------------------------------------------------
 
+# Ch10
 class WebhookRequest(BaseModel):
     url: str
     model_config = {"extra": "allow"}
@@ -533,12 +587,11 @@ class WebhookRequest(BaseModel):
 async def register_webhook(body: WebhookRequest):
     wh_id = f"wh-{uuid.uuid4().hex[:8]}"
     webhooks[wh_id] = {"webhook_id": wh_id, "url": body.url}
+    logger.info(f"Webhook registered: {wh_id} -> {body.url}")
     return {"webhook_id": wh_id, "url": body.url}
 
-# ---------------------------------------------------------------------------
-# Chapter 11: POST /integrations
-# ---------------------------------------------------------------------------
 
+# Ch11
 class IntegrationRequest(BaseModel):
     type: str
     webhook_url: str
@@ -553,29 +606,32 @@ async def register_integration(body: IntegrationRequest):
         "integration_id": intg_id,
         "type": body.type,
         "webhook_url": body.webhook_url,
-        "username": body.username,
-        "events": body.events,
+        "username": body.username or "ProxyWatch",
+        "events": body.events or ["alert.fired", "alert.resolved"],
     }
-    return {"integration_id": intg_id, "type": body.type, "webhook_url": body.webhook_url}
+    logger.info(f"Integration registered: {intg_id} type={body.type}")
+    return {
+        "integration_id": intg_id,
+        "type": body.type,
+        "webhook_url": body.webhook_url,
+    }
 
-# ---------------------------------------------------------------------------
-# Chapter 12: GET /metrics
-# ---------------------------------------------------------------------------
 
+# Ch12
 @app.get("/metrics")
 async def get_metrics():
     active_count = sum(1 for a in alerts.values() if a["status"] == "active")
     return {
-        "total_checks": metrics["total_checks"],
+        "total_checks": metrics_state["total_checks"],
         "current_pool_size": len(proxies),
         "active_alerts": active_count,
         "total_alerts": len(alerts),
-        "webhook_deliveries": metrics["webhook_deliveries"],
+        "webhook_deliveries": metrics_state["webhook_deliveries"],
     }
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry Point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
