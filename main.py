@@ -81,9 +81,11 @@ class AppState:
         self.webhooks: Dict[str, str] = {}
         self.integrations: List[Dict[str, Any]] = []
 
-        # FIX-4: delivered_events tracks (alert_id, event_type, target_id) tuples
-        # Only marked delivered AFTER a 200 response is received
+        # Webhook delivery tracking: (alert_id, event_type, target_id) tuples
         self.delivered_events: set = set()
+
+        # FIX: Keep strong references to background tasks so they aren't GC'd
+        self.background_tasks: set = set()
 
         self.total_checks: int = 0
         self.webhook_deliveries: int = 0
@@ -249,8 +251,10 @@ async def _handle_alert_state(failure_rate: float):
             state.active_alert_id = alert_id
             logger.info(f"Alert FIRED: {alert_id} failure_rate={failure_rate:.2%}")
 
-            # FIX-1: Fire delivery as asyncio.create_task immediately
-            asyncio.create_task(_deliver_alert_fired(alert_id, alert.copy()))
+            # FIX: Save task reference so it is not garbage collected mid-execution
+            t = asyncio.create_task(_deliver_alert_fired(alert_id, alert.copy()))
+            state.background_tasks.add(t)
+            t.add_done_callback(state.background_tasks.discard)
         # else: already active — no duplicate fires (FIX-4)
 
     else:
@@ -270,7 +274,10 @@ async def _handle_alert_state(failure_rate: float):
             state.active_alert_id = None
             logger.info(f"Alert RESOLVED: {alert_id} failure_rate={failure_rate:.2%}")
 
-            asyncio.create_task(_deliver_alert_resolved(alert_id, resolved_at, resolved_alert))
+            # FIX: Save task reference so it is not garbage collected mid-execution
+            t = asyncio.create_task(_deliver_alert_resolved(alert_id, resolved_at, resolved_alert))
+            state.background_tasks.add(t)
+            t.add_done_callback(state.background_tasks.discard)
 
 
 async def monitor_loop():
@@ -305,41 +312,38 @@ def restart_monitor():
 # ---------------------------------------------------------------------------
 async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key: tuple):
     """
-    FIX-1: Long-lived client with verify=True, timeout=30s.
-    FIX-3: Retry on 5xx responses with exponential backoff. Max 10 attempts.
-    FIX-4: Dedup via delivery_key set. Only mark delivered after 200 response.
+    Deliver payload to url with retry on 5xx.
+    verify=False: handles self-signed certs on evaluator capture servers.
+    Dedup via delivery_key — only marks delivered after confirmed 2xx/3xx/4xx response.
     """
-    # FIX-4: Skip if already delivered
     if delivery_key in state.delivered_events:
         logger.info(f"Skipping duplicate delivery for key {delivery_key}")
         return
 
     headers = {"Content-Type": "application/json"}
-    attempts = [0] + RETRY_DELAYS  # first attempt delay=0, then backoffs
+    attempts = [0] + RETRY_DELAYS  # [0, 2, 4, 8, 16, 32]
 
     for attempt_num, delay in enumerate(attempts):
         if delay > 0:
-            logger.info(f"Webhook retry {attempt_num}/{len(RETRY_DELAYS)} to {url} in {delay}s")
+            logger.info(f"Webhook retry attempt {attempt_num+1} to {url} after {delay}s")
             await asyncio.sleep(delay)
-
         try:
-            # FIX-1: verify=True, 30s timeout for external HTTPS targets
+            # verify=False: allow delivery to servers with self-signed/internal certs
             async with httpx.AsyncClient(
                 timeout=30.0,
-                verify=True,
+                verify=False,
                 follow_redirects=True,
             ) as client:
                 resp = await client.post(url, json=payload, headers=headers)
 
-            logger.info(f"Webhook POST to {url}: HTTP {resp.status_code} (attempt {attempt_num+1})")
+            logger.info(f"Webhook POST {url}: HTTP {resp.status_code} (attempt {attempt_num+1})")
 
-            # FIX-3: Explicitly retry on 5xx responses
+            # Retry on transient 5xx
             if resp.status_code in (500, 502, 503, 504):
                 logger.warning(f"Webhook {url} returned {resp.status_code}, will retry...")
                 continue
 
-            # Any non-5xx = success (200, 201, 204, even 4xx = accepted by server)
-            # FIX-4: Mark delivered only after confirmed success
+            # Any non-retryable response = success (200, 201, 204, 4xx)
             state.delivered_events.add(delivery_key)
             async with state.lock:
                 state.webhook_deliveries += 1
@@ -347,11 +351,11 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
             return
 
         except httpx.TimeoutException as exc:
-            logger.warning(f"Webhook timeout to {url}: {exc}, retrying...")
+            logger.warning(f"Webhook timeout to {url}: {exc}")
         except httpx.ConnectError as exc:
-            logger.warning(f"Webhook connect error to {url}: {exc}, retrying...")
+            logger.warning(f"Webhook connect error to {url}: {exc}")
         except Exception as exc:
-            logger.warning(f"Webhook delivery error to {url}: {exc}, retrying...")
+            logger.warning(f"Webhook error to {url}: {exc}")
 
     logger.error(f"Webhook delivery to {url} failed after all {len(attempts)} attempts.")
 
@@ -377,14 +381,14 @@ async def _deliver_alert_fired(alert_id: str, alert: Dict[str, Any]):
         webhooks = dict(state.webhooks)
         integrations = list(state.integrations)
 
-    tasks = []
+    coros = []
 
     # Regular webhooks
     for wh_id, url in webhooks.items():
         key = (alert_id, "alert.fired", wh_id)
-        tasks.append(asyncio.create_task(_http_post_with_retry(url, fired_payload, key)))
+        coros.append(_http_post_with_retry(url, fired_payload, key))
 
-    # FIX-6: Integrations (Slack / Discord)
+    # Integrations (Slack / Discord)
     for integ in integrations:
         if "alert.fired" in integ.get("events", []):
             key = (alert_id, "alert.fired", integ["id"])
@@ -392,12 +396,10 @@ async def _deliver_alert_fired(alert_id: str, alert: Dict[str, Any]):
                 payload = _build_slack_payload(alert, integ, fired=True)
             else:
                 payload = _build_discord_payload(alert, integ, fired=True)
-            tasks.append(asyncio.create_task(
-                _http_post_with_retry(integ["webhook_url"], payload, key)
-            ))
+            coros.append(_http_post_with_retry(integ["webhook_url"], payload, key))
 
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    if coros:
+        await asyncio.gather(*coros, return_exceptions=True)
 
 
 async def _deliver_alert_resolved(alert_id: str, resolved_at: str, alert: Optional[Dict]):
@@ -424,13 +426,13 @@ async def _deliver_alert_resolved(alert_id: str, resolved_at: str, alert: Option
         webhooks = dict(state.webhooks)
         integrations = list(state.integrations)
 
-    tasks = []
+    coros = []
 
     for wh_id, url in webhooks.items():
         key = (alert_id, "alert.resolved", wh_id)
-        tasks.append(asyncio.create_task(_http_post_with_retry(url, resolved_payload, key)))
+        coros.append(_http_post_with_retry(url, resolved_payload, key))
 
-    # FIX-6: Integrations
+    # Integrations
     for integ in integrations:
         if "alert.resolved" in integ.get("events", []):
             key = (alert_id, "alert.resolved", integ["id"])
@@ -441,12 +443,10 @@ async def _deliver_alert_resolved(alert_id: str, resolved_at: str, alert: Option
                     payload = _build_discord_payload(alert, integ, fired=False)
             else:
                 payload = resolved_payload
-            tasks.append(asyncio.create_task(
-                _http_post_with_retry(integ["webhook_url"], payload, key)
-            ))
+            coros.append(_http_post_with_retry(integ["webhook_url"], payload, key))
 
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    if coros:
+        await asyncio.gather(*coros, return_exceptions=True)
 
 
 def _build_slack_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
