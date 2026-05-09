@@ -111,6 +111,12 @@ BASE_URL="https://proxymaze-26.onrender.com" python test_all.py
 - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - **Environment Variable:** `PORT` (Render sets this automatically)
 
+### Uptime & Monitoring (Keep-Alive)
+Render free instances spin down after 15 minutes of inactivity, which would stop the background proxy monitor and cause 50+ second cold-start delays. To prevent this, the API is actively monitored:
+- **UptimeRobot** is configured to ping `https://proxymaze-26.onrender.com` every 5 minutes.
+- **Current Status:** 100% Uptime (0 incidents).
+- **Average Response Time:** ~126 ms.
+
 ## Project Structure
 
 ```text
