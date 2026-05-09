@@ -286,7 +286,10 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
         return
 
     state.inflight_events.add(delivery_key)
-    headers = {"User-Agent": "ProxyMaze/1.0"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "ProxyMaze/1.0"
+    }
 
     for attempt, delay in enumerate([0] + RETRY_DELAYS):
         if delay > 0:
@@ -295,7 +298,7 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
             state.inflight_events.discard(delivery_key)
             return
         try:
-            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            async with httpx.AsyncClient(timeout=8.0, verify=False, follow_redirects=True) as client:
                 resp = await client.post(url, json=payload, headers=headers)
             logger.info(f"Webhook POST {url} -> {resp.status_code} (attempt {attempt+1})")
             # Retry only on 5xx transient errors
