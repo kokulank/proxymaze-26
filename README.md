@@ -8,6 +8,8 @@
 
 ## Overview
 
+**Live Deployment:** [https://proxymaze-26.onrender.com](https://proxymaze-26.onrender.com)
+
 ProxyMaze'26 is a production-quality HTTP API that continuously monitors a pool of proxy URLs via real HTTP probes. It tracks the up, down, and pending status of each proxy and automatically fires threshold-based alerts (when the failure rate reaches >= 20%). The service handles reliable webhook delivery with exponential retry, and natively supports Slack and Discord integrations for real-time alerting.
 
 ## Requirements
@@ -68,10 +70,29 @@ $env:PORT=9090; python main.py
 
 ## Running Tests
 
+### Local Testing
 ```bash
-# Start the server first, then in a second terminal:
+# Start the server first (in one terminal)
+python main.py
+
+# In a second terminal:
 python test_all.py
 ```
+
+### Testing the Live Deployment
+You can point the test suite directly at the live Render API using the `BASE_URL` environment variable:
+
+```powershell
+# Windows PowerShell
+$env:BASE_URL="https://proxymaze-26.onrender.com"
+python test_all.py
+```
+
+```bash
+# Linux/Mac
+BASE_URL="https://proxymaze-26.onrender.com" python test_all.py
+```
+
 *Expected output: 87 passed, 0 failed*
 
 ## Deploying to Render
