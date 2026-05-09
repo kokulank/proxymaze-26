@@ -1,18 +1,9 @@
 """
-ProxyMaze'26 — Real-time Proxy Monitoring HTTP API
+ProxyMaze'26 — Real‑time Proxy Monitoring HTTP API
 Torch Labs Sri Lanka
 
-Production-quality implementation targeting 270/270 score.
-
-KEY FIXES over the initial 170‑score version:
-  - Webhook payloads now include the mandatory `timestamp` field.
-  - Ordered delivery: a new alert’s fired webhook waits for the previous
-    resolved webhook to finish (using a per‑alert task chain).
-  - Webhook retry keeps working (transient 5xx → retry, permanent 4xx → stop).
-  - Slack/Discord payloads are correctly formatted and delivered through the
-    same dedup + retry mechanism.
-  - Monitoring, alert state machine, and proxy classification remain unchanged
-    from the working 170‑score baseline.
+Final fix: non‑blocking delivery tasks (prevents monitor deadlock),
+timestamp field added to all webhook payloads, Slack/Discord payloads correct.
 """
 
 import asyncio
@@ -21,7 +12,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from contextlib import asynccontextmanager
 
 import httpx
@@ -44,7 +35,6 @@ ALERT_THRESHOLD = 0.20
 DEFAULT_CHECK_INTERVAL = 30            # seconds
 DEFAULT_REQUEST_TIMEOUT = 5000         # milliseconds
 PORT = int(os.environ.get("PORT", 7000))
-
 RETRY_DELAYS = [2, 4, 8, 16, 32]      # seconds
 
 
@@ -79,14 +69,12 @@ class AppState:
         self.alerts: List[Dict[str, Any]] = []
         self.active_alert_id: Optional[str] = None
 
-        self.webhooks: Dict[str, str] = {}          # id → url
+        self.webhooks: Dict[str, str] = {}          # id -> url
         self.integrations: List[Dict[str, Any]] = []
 
-        # Delivery dedup & ordering
-        self.delivered_events: Set[tuple] = set()   # (alert_id, event_type, target_id)
-        self.inflight_events: Set[tuple] = set()
-        # We chain delivery tasks so that resolved is fully delivered before the next fired
-        self.last_delivery_task: Optional[asyncio.Task] = None
+        # Delivery dedup: (alert_id, event_type, target_id) -> True after success
+        self.delivered_events: Set[Tuple[str, str, str]] = set()
+        self.inflight_events: Set[Tuple[str, str, str]] = set()
 
         self.background_tasks: set = set()
 
@@ -122,7 +110,7 @@ state = AppState()
 
 
 # ---------------------------------------------------------------------------
-# Probe logic – strict 2xx = up
+# Probe logic – strict 2xx = up, everything else = down
 # ---------------------------------------------------------------------------
 async def probe_proxy(proxy: Dict[str, Any], timeout_ms: int) -> str:
     url = proxy["url"]
@@ -153,6 +141,7 @@ async def run_monitor_cycle():
     if not snapshots:
         return
 
+    # Probe all concurrently
     tasks = {
         pid: asyncio.create_task(probe_proxy(snapshots[pid], timeout_ms))
         for pid in snapshots
@@ -191,6 +180,7 @@ async def run_monitor_cycle():
 
 
 async def _handle_alert_state(failure_rate: float):
+    """Non‑blocking alert state machine. Schedules delivery tasks independently."""
     if failure_rate >= ALERT_THRESHOLD:
         if state.active_alert_id is not None:
             # Update live fields only
@@ -227,20 +217,13 @@ async def _handle_alert_state(failure_rate: float):
         state.active_alert_id = alert_id
         logger.info(f"Alert FIRED: {alert_id} failure_rate={failure_rate:.2%}")
 
-        # Wait for any previous resolved delivery to finish
-        if state.last_delivery_task and not state.last_delivery_task.done():
-            try:
-                await state.last_delivery_task
-            except Exception:
-                pass
-
+        # Snapshot current webhooks & integrations (no lock required inside tasks)
         webhooks_snap = dict(state.webhooks)
         integrations_snap = list(state.integrations)
 
         t = asyncio.create_task(
             _deliver_alert_fired(alert_id, alert.copy(), webhooks_snap, integrations_snap)
         )
-        state.last_delivery_task = t
         state.background_tasks.add(t)
         t.add_done_callback(state.background_tasks.discard)
 
@@ -268,7 +251,6 @@ async def _handle_alert_state(failure_rate: float):
                     alert_id, resolved_at, resolved_alert, webhooks_snap, integrations_snap
                 )
             )
-            state.last_delivery_task = t
             state.background_tasks.add(t)
             t.add_done_callback(state.background_tasks.discard)
 
@@ -299,9 +281,9 @@ def restart_monitor():
 
 
 # ---------------------------------------------------------------------------
-# Webhook delivery with retry + dedup
+# Webhook delivery with retry + dedup (non‑blocking tasks)
 # ---------------------------------------------------------------------------
-async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key: tuple):
+async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key: Tuple[str, str, str]):
     if delivery_key in state.delivered_events:
         return
     if delivery_key in state.inflight_events:
@@ -326,7 +308,7 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
             if resp.status_code in (429, 500, 502, 503, 504):
                 logger.warning(f"Webhook {url} returned {resp.status_code}, retry…")
                 continue
-            # Permanent error → do not add to delivered, but stop retrying
+            # Permanent error (e.g. 4xx) – stop retrying
             logger.error(f"Webhook {url} returned {resp.status_code}, giving up.")
             break
         except Exception as e:
@@ -346,7 +328,7 @@ async def _deliver_alert_fired(
         "alert_id": alert_id,
         "status": "active",
         "fired_at": alert["fired_at"],
-        "timestamp": alert["fired_at"],
+        "timestamp": alert["fired_at"],          # REQUIRED BY SPEC
         "failure_rate": alert["failure_rate"],
         "total_proxies": alert["total_proxies"],
         "failed_proxies": alert["failed_proxies"],
@@ -364,10 +346,10 @@ async def _deliver_alert_fired(
         if "alert.fired" in integ.get("events", []):
             key = (alert_id, "alert.fired", integ["id"])
             if integ["type"] == "slack":
-                payload = _build_slack_payload(alert, integ, fired=True)
+                integ_payload = _build_slack_payload(alert, integ, fired=True)
             else:
-                payload = _build_discord_payload(alert, integ, fired=True)
-            coros.append(_http_post_with_retry(integ["webhook_url"], payload, key))
+                integ_payload = _build_discord_payload(alert, integ, fired=True)
+            coros.append(_http_post_with_retry(integ["webhook_url"], integ_payload, key))
 
     if coros:
         await asyncio.gather(*coros, return_exceptions=True)
@@ -385,7 +367,7 @@ async def _deliver_alert_resolved(
         "alert_id": alert_id,
         "status": "resolved",
         "resolved_at": resolved_at,
-        "timestamp": resolved_at,
+        "timestamp": resolved_at,                # REQUIRED BY SPEC
     }
     if alert:
         resolved_payload.update({
@@ -407,19 +389,19 @@ async def _deliver_alert_resolved(
             key = (alert_id, "alert.resolved", integ["id"])
             if alert:
                 if integ["type"] == "slack":
-                    payload = _build_slack_payload(alert, integ, fired=False)
+                    integ_payload = _build_slack_payload(alert, integ, fired=False)
                 else:
-                    payload = _build_discord_payload(alert, integ, fired=False)
+                    integ_payload = _build_discord_payload(alert, integ, fired=False)
             else:
-                payload = resolved_payload
-            coros.append(_http_post_with_retry(integ["webhook_url"], payload, key))
+                integ_payload = resolved_payload
+            coros.append(_http_post_with_retry(integ["webhook_url"], integ_payload, key))
 
     if coros:
         await asyncio.gather(*coros, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
-# Slack / Discord payload builders (unchanged from spec)
+# Slack & Discord payload builders (unchanged)
 # ---------------------------------------------------------------------------
 def _build_slack_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
     color = "#FF0000" if fired else "#36A64F"
@@ -455,7 +437,7 @@ def _build_slack_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
 
 
 def _build_discord_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
-    color_int = 16711680 if fired else 3580392
+    color_int = 16711680 if fired else 3580392   # red / green
     title = "ProxyMaze Alert Fired 🔴" if fired else "ProxyMaze Alert Resolved 🟢"
     rate_pct = f"{alert['failure_rate'] * 100:.1f}%"
     description = (
@@ -509,7 +491,7 @@ app = FastAPI(
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Endpoints (unchanged)
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
