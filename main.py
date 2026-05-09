@@ -286,10 +286,7 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
         return
 
     state.inflight_events.add(delivery_key)
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "ProxyMaze/1.0",
-    }
+    headers = {"User-Agent": "ProxyMaze/1.0"}
 
     for attempt, delay in enumerate([0] + RETRY_DELAYS):
         if delay > 0:
@@ -298,14 +295,8 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
             state.inflight_events.discard(delivery_key)
             return
         try:
-            # 8s timeout — allows 5 attempts within 60s window (0+2+4+8+16=30s delays + 5*8=40s max)
-            async with httpx.AsyncClient(
-                timeout=8.0,
-                verify=False,
-                follow_redirects=True,
-                headers=headers,
-            ) as client:
-                resp = await client.post(url, json=payload)
+            async with httpx.AsyncClient(timeout=30.0, verify=False, follow_redirects=True) as client:
+                resp = await client.post(url, json=payload, headers=headers)
             logger.info(f"Webhook POST {url} -> {resp.status_code} (attempt {attempt+1})")
             # Retry only on 5xx transient errors
             if resp.status_code in (429, 500, 502, 503, 504):
@@ -411,35 +402,63 @@ async def _deliver_alert_resolved(
 # Slack / Discord payload builders (unchanged from spec)
 # ---------------------------------------------------------------------------
 def _build_slack_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
-    color = "#FF0000" if fired else "#36A64F"
     rate_pct = f"{alert['failure_rate'] * 100:.1f}%"
     event_label = "FIRED 🔴" if fired else "RESOLVED 🟢"
     text = (
         f"*ProxyMaze Alert {event_label}*: failure rate {rate_pct} "
         f"(threshold {ALERT_THRESHOLD * 100:.1f}%)"
     )
-    fields = [
-        {"title": "Alert ID",       "value": alert["alert_id"],                                "short": True},
-        {"title": "Failure Rate",   "value": rate_pct,                                         "short": True},
-        {"title": "Failed Proxies", "value": str(alert["failed_proxies"]),                     "short": True},
-        {"title": "Threshold",      "value": f"{ALERT_THRESHOLD * 100:.1f}%",                 "short": True},
-        {"title": "Failed IDs",     "value": ", ".join(alert["failed_proxy_ids"]) or "none",  "short": False},
-        {"title": "Fired At",       "value": alert.get("fired_at", ""),                       "short": False},
+    
+    # Block Kit requires text to be <= 3000 chars, etc.
+    blocks = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"ProxyMaze Alert {event_label}",
+                "emoji": True
+            }
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Alert ID:*\n{alert['alert_id']}"},
+                {"type": "mrkdwn", "text": f"*Status:*\n{alert['status']}"},
+                {"type": "mrkdwn", "text": f"*Failure Rate:*\n{rate_pct}"},
+                {"type": "mrkdwn", "text": f"*Threshold:*\n{ALERT_THRESHOLD * 100:.1f}%"},
+                {"type": "mrkdwn", "text": f"*Failed Proxies:*\n{alert['failed_proxies']}"},
+                {"type": "mrkdwn", "text": f"*Fired At:*\n{alert.get('fired_at', '')}"}
+            ]
+        }
     ]
+    
+    if alert.get("failed_proxy_ids"):
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Failed IDs:*\n{', '.join(alert['failed_proxy_ids'])}"
+            }
+        })
+        
     if not fired and alert.get("resolved_at"):
-        fields.append({"title": "Resolved At", "value": alert["resolved_at"], "short": False})
+        blocks[1]["fields"].append({"type": "mrkdwn", "text": f"*Resolved At:*\n{alert['resolved_at']}"})
+
+    blocks.append({
+        "type": "context",
+        "elements": [
+            {
+                "type": "plain_text",
+                "text": f"ProxyMaze'26 | Torch Labs | ts: {unix_epoch_int()}",
+                "emoji": True
+            }
+        ]
+    })
 
     return {
         "username": integ.get("username", "ProxyWatch"),
         "text": text,
-        "attachments": [
-            {
-                "color": color,
-                "fields": fields,
-                "footer": "ProxyMaze'26 | Torch Labs",
-                "ts": unix_epoch_int(),
-            }
-        ],
+        "blocks": blocks,
     }
 
 
@@ -462,12 +481,14 @@ def _build_discord_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
         fields.append({"name": "Resolved At", "value": alert["resolved_at"], "inline": False})
 
     return {
+        "username": integ.get("username", "ProxyWatch"),
         "embeds": [
             {
                 "title": title,
                 "description": description,
                 "color": color_int,
                 "fields": fields,
+                "timestamp": alert.get("fired_at") or alert.get("resolved_at"),
                 "footer": {"text": "ProxyMaze'26 | Torch Labs"},
             }
         ]
