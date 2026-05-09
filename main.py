@@ -158,9 +158,9 @@ async def probe_proxy(proxy: Dict[str, Any], timeout_ms: int) -> str:
         ) as client:
             resp = await client.get(url)
 
-        if resp.status_code >= 500:
-            return "down"
-        return "up"
+        if 200 <= resp.status_code < 300:
+            return "up"
+        return "down"
 
     except Exception:
         return "down"
@@ -424,6 +424,7 @@ async def _deliver_alert_fired(
     fired_payload = {
         "event": "alert.fired",
         "alert_id": alert_id,
+        "status": "active",
         "fired_at": alert["fired_at"],
         "failure_rate": alert["failure_rate"],
         "total_proxies": alert["total_proxies"],
@@ -469,6 +470,7 @@ async def _deliver_alert_resolved(
     resolved_payload = {
         "event": "alert.resolved",
         "alert_id": alert_id,
+        "status": "resolved",
         "resolved_at": resolved_at,
     }
     if alert:
@@ -782,45 +784,41 @@ async def get_alerts():
 # ---------------------------------------------------------------------------
 # POST /webhooks
 # ---------------------------------------------------------------------------
-class WebhookBody(BaseModel):
-    url: str
-    model_config = ConfigDict(extra="ignore")
-
-
-@app.post("/webhooks", status_code=201)
-async def post_webhooks(body: WebhookBody):
+@app.post("/webhooks", status_code=200)
+async def post_webhooks(body: dict):
+    url = body.get("url") or body.get("webhook_url") or body.get("target_url")
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing url")
     wh_id = f"wh-{uuid.uuid4().hex[:8]}"
     async with state.lock:
-        state.webhooks[wh_id] = body.url
-    return {"webhook_id": wh_id, "url": body.url}
+        state.webhooks[wh_id] = url
+    # Return both id and webhook_id to be safe
+    return {"id": wh_id, "webhook_id": wh_id, "url": url}
 
 
 # ---------------------------------------------------------------------------
 # POST /integrations
 # ---------------------------------------------------------------------------
-class IntegrationBody(BaseModel):
-    type: str
-    webhook_url: str
-    username: Optional[str] = "ProxyWatch"
-    events: Optional[List[str]] = ["alert.fired", "alert.resolved"]
-    model_config = ConfigDict(extra="ignore")
-
-
-@app.post("/integrations", status_code=201)
-async def post_integrations(body: IntegrationBody):
-    if body.type not in ("slack", "discord"):
+@app.post("/integrations", status_code=200)
+async def post_integrations(body: dict):
+    type_ = body.get("type")
+    webhook_url = body.get("webhook_url") or body.get("url")
+    if type_ not in ("slack", "discord"):
         raise HTTPException(status_code=400, detail="type must be 'slack' or 'discord'.")
+    if not webhook_url:
+        raise HTTPException(status_code=400, detail="Missing webhook_url")
     integ_id = f"integ-{uuid.uuid4().hex[:8]}"
     integ = {
         "id": integ_id,
-        "type": body.type,
-        "webhook_url": body.webhook_url,
-        "username": body.username or "ProxyWatch",
-        "events": body.events or ["alert.fired", "alert.resolved"],
+        "type": type_,
+        "webhook_url": webhook_url,
+        "username": body.get("username", "ProxyWatch"),
+        "events": body.get("events", ["alert.fired", "alert.resolved"]),
     }
     async with state.lock:
         state.integrations.append(integ)
-    return {"integration_id": integ_id, "type": body.type, "webhook_url": body.webhook_url}
+    # Return both id and integration_id
+    return {"id": integ_id, "integration_id": integ_id, "type": type_, "webhook_url": webhook_url}
 
 
 # ---------------------------------------------------------------------------
