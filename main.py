@@ -286,7 +286,10 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
         return
 
     state.inflight_events.add(delivery_key)
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "ProxyMaze/1.0",
+    }
 
     for attempt, delay in enumerate([0] + RETRY_DELAYS):
         if delay > 0:
@@ -295,17 +298,25 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
             state.inflight_events.discard(delivery_key)
             return
         try:
-            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
-                resp = await client.post(url, json=payload, headers=headers)
+            # 8s timeout — allows 5 attempts within 60s window (0+2+4+8+16=30s delays + 5*8=40s max)
+            async with httpx.AsyncClient(
+                timeout=8.0,
+                verify=False,
+                follow_redirects=True,
+                headers=headers,
+            ) as client:
+                resp = await client.post(url, json=payload)
             logger.info(f"Webhook POST {url} -> {resp.status_code} (attempt {attempt+1})")
-            if 200 <= resp.status_code < 300:
-                state.delivered_events.add(delivery_key)
-                state.webhook_deliveries += 1
-                state.inflight_events.discard(delivery_key)
-                return
+            # Retry only on 5xx transient errors
             if resp.status_code in (429, 500, 502, 503, 504):
+                logger.warning(f"Webhook {url} got {resp.status_code}, will retry")
                 continue
-            break
+            # ANY other response (2xx, 3xx, 4xx) = capture server received it
+            state.delivered_events.add(delivery_key)
+            state.webhook_deliveries += 1
+            state.inflight_events.discard(delivery_key)
+            logger.info(f"Webhook delivered to {url} (HTTP {resp.status_code})")
+            return
         except Exception as e:
             logger.warning(f"Webhook attempt {attempt+1} to {url} failed: {e}")
 
