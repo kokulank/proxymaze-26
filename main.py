@@ -546,6 +546,12 @@ async def health():
     return {"status": "ok"}
 
 
+# Test helper: always returns 503 so probes classify it as "down"
+@app.get("/fail/{proxy_id}")
+async def fail_endpoint(proxy_id: str):
+    return Response(status_code=503)
+
+
 # ---------------------------------------------------------------------------
 # POST /config
 # ---------------------------------------------------------------------------

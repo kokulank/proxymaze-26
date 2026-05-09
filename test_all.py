@@ -128,8 +128,8 @@ def test_ch04_post_proxies():
     # Use httpbin as real targets so probes can succeed
     body = {
         "proxies": [
-            "https://httpbin.org/get/px-001",
-            "https://httpbin.org/get/px-002",
+            f"{BASE_URL}/health/px-001",
+            f"{BASE_URL}/health/px-002",
             "https://this-host-should-not-exist-xyz.invalid/proxy/px-003",
         ],
         "replace": True,
@@ -144,7 +144,7 @@ def test_ch04_post_proxies():
     check("px-003 starts pending", statuses.get("px-003") == "pending", str(statuses))
 
     # Append mode
-    body2 = {"proxies": ["https://httpbin.org/get/px-004"], "replace": False}
+    body2 = {"proxies": [f"{BASE_URL}/health/px-004"], "replace": False}
     r2 = post("/proxies", json=body2)
     check("Append — status 201", r2.status_code == 201)
     j2 = r2.json()
@@ -161,7 +161,7 @@ def test_ch04_post_proxies():
 
 def test_ch04_replace_true():
     section("Ch04b — POST /proxies replace:true clears pool")
-    body = {"proxies": ["https://httpbin.org/get/px-010", "https://httpbin.org/get/px-011"], "replace": True}
+    body = {"proxies": [f"{BASE_URL}/health/px-010", f"{BASE_URL}/health/px-011"], "replace": True}
     r = post("/proxies", json=body)
     check("Replace — 201", r.status_code == 201)
     r2 = get("/proxies")
@@ -240,7 +240,7 @@ def test_ch07_get_history():
 def test_ch08_delete_proxies():
     section("Ch08 — DELETE /proxies")
     # Add some proxies first
-    post("/proxies", json={"proxies": ["https://httpbin.org/get/px-del-1"], "replace": False})
+    post("/proxies", json={"proxies": [f"{BASE_URL}/health/px-del-1"], "replace": False})
     r = delete("/proxies")
     check("Status 204", r.status_code == 204, str(r.status_code))
     r2 = get("/proxies")
@@ -326,8 +326,8 @@ def test_alert_lifecycle(webhook_url: str):
     """
     section("Alert Lifecycle — fire + resolve (integration test)")
 
-    # Use proxies guaranteed to fail (unreachable hosts) to push failure_rate above 0.20
-    bad_proxies = [f"https://dead-host-{i}.invalid/proxy/px-bad-{i:03d}" for i in range(5)]
+    # Use /fail/{id} endpoint which always returns 503 → reliably "down"
+    bad_proxies = [f"{BASE_URL}/fail/px-bad-{i:03d}" for i in range(5)]
     good_proxies = []  # start with all bad
 
     post("/config", json={"check_interval_seconds": 3, "request_timeout_ms": 1000})
@@ -363,9 +363,9 @@ def test_alert_lifecycle(webhook_url: str):
 
     # Now resolve: replace pool with all-good proxies
     # We'll use httpbin which should respond 200
-    good = ["https://httpbin.org/get/px-good-001", "https://httpbin.org/get/px-good-002",
-            "https://httpbin.org/get/px-good-003", "https://httpbin.org/get/px-good-004",
-            "https://httpbin.org/get/px-good-005"]
+    good = [f"{BASE_URL}/health/px-good-001", f"{BASE_URL}/health/px-good-002",
+            f"{BASE_URL}/health/px-good-003", f"{BASE_URL}/health/px-good-004",
+            f"{BASE_URL}/health/px-good-005"]
     post("/proxies", json={"proxies": good, "replace": True})
     post("/config", json={"check_interval_seconds": 3, "request_timeout_ms": 3000})
 
@@ -396,6 +396,9 @@ def test_alert_lifecycle(webhook_url: str):
 
 def test_webhook_delivery(webhook_url: str):
     section("Webhook delivery check")
+    if "localhost" not in BASE_URL and "127.0.0.1" not in BASE_URL:
+        check("Skipped webhook delivery check (remote host cannot reach local receiver)", True)
+        return
     print(f"  {INFO}  Checking if alert.fired was delivered to receiver…")
     time.sleep(5)  # allow delivery
     fired_events = [e for e in received_events if e.get("event") == "alert.fired"]
@@ -431,7 +434,7 @@ def test_proxy_id_extraction():
 
 def test_pending_not_counted():
     section("Pending proxies not counted in failure_rate")
-    post("/proxies", json={"proxies": ["https://httpbin.org/get/px-new-777"], "replace": True})
+    post("/proxies", json={"proxies": [f"{BASE_URL}/health/px-new-777"], "replace": True})
     r = get("/proxies")
     j = r.json()
     # All pending → failure_rate should be 0.0
