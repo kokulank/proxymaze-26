@@ -113,11 +113,13 @@ async def probe_proxy(proxy: Dict[str, Any], timeout_ms: int) -> str:
     timeout_sec = timeout_ms / 1000.0
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout_sec),
-            follow_redirects=True,
             verify=False,
+            follow_redirects=True,
         ) as client:
-            resp = await client.get(url)
+            resp = await asyncio.wait_for(
+                client.get(url, timeout=timeout_sec),
+                timeout=timeout_sec + 0.5
+            )
         if 200 <= resp.status_code < 300:
             return "up"
         return "down"
@@ -298,7 +300,7 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
             state.inflight_events.discard(delivery_key)
             return
         try:
-            async with httpx.AsyncClient(timeout=8.0, verify=False, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=15.0, verify=False, follow_redirects=True) as client:
                 resp = await client.post(url, json=payload, headers=headers)
             logger.info(f"Webhook POST {url} -> {resp.status_code} (attempt {attempt+1})")
             # Retry only on 5xx transient errors
@@ -333,7 +335,7 @@ async def _deliver_alert_fired(
         "alert_id": alert_id,
         "status": "active",
         "fired_at": alert["fired_at"],
-        "timestamp": unix_epoch_int(),
+        "timestamp": utcnow_iso(),
         "failure_rate": alert["failure_rate"],
         "total_proxies": alert["total_proxies"],
         "failed_proxies": alert["failed_proxies"],
@@ -372,7 +374,7 @@ async def _deliver_alert_resolved(
         "alert_id": alert_id,
         "status": "resolved",
         "resolved_at": resolved_at,
-        "timestamp": unix_epoch_int(),
+        "timestamp": utcnow_iso(),
     }
     if alert:
         resolved_payload.update({
@@ -416,14 +418,13 @@ def _build_slack_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
         f"(threshold {ALERT_THRESHOLD * 100:.1f}%)"
     )
     
-    # Block Kit requires text to be <= 3000 chars, etc.
+    # Block Kit inside an attachment for color and timestamp support
     blocks = [
         {
-            "type": "header",
+            "type": "section",
             "text": {
-                "type": "plain_text",
-                "text": f"ProxyMaze Alert {event_label}",
-                "emoji": True
+                "type": "mrkdwn",
+                "text": f"*ProxyMaze Alert {event_label}*"
             }
         },
         {
@@ -456,7 +457,7 @@ def _build_slack_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
         "elements": [
             {
                 "type": "plain_text",
-                "text": f"ProxyMaze'26 | Torch Labs | ts: {unix_epoch_int()}",
+                "text": "ProxyMaze'26 | Torch Labs",
                 "emoji": True
             }
         ]
@@ -465,7 +466,13 @@ def _build_slack_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
     return {
         "username": integ.get("username", "ProxyWatch"),
         "text": text,
-        "blocks": blocks,
+        "attachments": [
+            {
+                "color": "#FF0000" if fired else "#36A64F",
+                "blocks": blocks,
+                "ts": unix_epoch_int()
+            }
+        ]
     }
 
 
