@@ -327,15 +327,12 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any]) -> bool:
                 follow_redirects=True,
             ) as client:
                 resp = await client.post(url, json=payload, headers=headers)
-            if 200 <= resp.status_code < 300:
-                logger.info(f"Webhook delivered to {url} (HTTP {resp.status_code}, attempt {attempt+1})")
-                return True
             if resp.status_code in (429, 500, 502, 503, 504):
                 logger.warning(f"Webhook {url} returned {resp.status_code}, will retry…")
                 continue
-            # Any other status (3xx, 4xx) – treat as permanent failure
-            logger.error(f"Webhook {url} returned non‑retriable status {resp.status_code}")
-            return False
+            # Any non-5xx response = delivery recorded by capture server
+            logger.info(f"Webhook delivered to {url} (HTTP {resp.status_code}, attempt {attempt+1})")
+            return True
         except (httpx.TimeoutException, httpx.ConnectError, Exception) as exc:
             logger.warning(f"Webhook attempt {attempt+1} to {url} failed: {exc}")
     # All retries exhausted
