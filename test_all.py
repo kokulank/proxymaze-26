@@ -326,8 +326,9 @@ def test_alert_lifecycle(webhook_url: str):
     """
     section("Alert Lifecycle — fire + resolve (integration test)")
 
-    # Use /fail/{id} endpoint which always returns 503 → reliably "down"
-    bad_proxies = [f"{BASE_URL}/fail/px-bad-{i:03d}" for i in range(5)]
+    # Use localhost closed-port URLs: instant "Connection refused" on any server
+    # 127.0.0.1:19999 is virtually never open → ConnectError → classified as "down"
+    bad_proxies = [f"http://127.0.0.1:19999/proxy/px-bad-{i:03d}" for i in range(5)]
     good_proxies = []  # start with all bad
 
     post("/config", json={"check_interval_seconds": 3, "request_timeout_ms": 1000})
