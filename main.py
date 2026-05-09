@@ -386,7 +386,7 @@ async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key:
             logger.info(f"Webhook POST {url}: HTTP {resp.status_code} (attempt {attempt_num + 1})")
 
             # Transient server errors — retry
-            if resp.status_code in (500, 502, 503, 504):
+            if resp.status_code in (429, 500, 502, 503, 504):
                 logger.warning(f"Webhook {url} returned {resp.status_code}, will retry...")
                 continue
 
@@ -784,7 +784,7 @@ async def get_alerts():
 # ---------------------------------------------------------------------------
 # POST /webhooks
 # ---------------------------------------------------------------------------
-@app.post("/webhooks", status_code=200)
+@app.post("/webhooks", status_code=201)
 async def post_webhooks(body: dict):
     url = body.get("url") or body.get("webhook_url") or body.get("target_url")
     if not url:
@@ -796,10 +796,16 @@ async def post_webhooks(body: dict):
     return {"id": wh_id, "webhook_id": wh_id, "url": url}
 
 
+@app.get("/webhooks")
+async def get_webhooks():
+    async with state.lock:
+        return [{"id": k, "webhook_id": k, "url": v} for k, v in state.webhooks.items()]
+
+
 # ---------------------------------------------------------------------------
 # POST /integrations
 # ---------------------------------------------------------------------------
-@app.post("/integrations", status_code=200)
+@app.post("/integrations", status_code=201)
 async def post_integrations(body: dict):
     type_ = body.get("type")
     webhook_url = body.get("webhook_url") or body.get("url")
@@ -819,6 +825,12 @@ async def post_integrations(body: dict):
         state.integrations.append(integ)
     # Return both id and integration_id
     return {"id": integ_id, "integration_id": integ_id, "type": type_, "webhook_url": webhook_url}
+
+
+@app.get("/integrations")
+async def get_integrations():
+    async with state.lock:
+        return list(state.integrations)
 
 
 # ---------------------------------------------------------------------------
