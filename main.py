@@ -108,14 +108,12 @@ class AppState:
         self.monitor_task: Optional[asyncio.Task] = None
 
     def _compute_failure_rate(self) -> float:
-        """
-        failure_rate = down / total (ALL proxies, including pending).
-        """
-        total = len(self.proxies)
-        if not total:
+        """failure_rate = down / (up + down), excluding pending proxies."""
+        probed = [p for p in self.proxies.values() if p["status"] in ("up", "down")]
+        if not probed:
             return 0.0
-        down = sum(1 for p in self.proxies.values() if p["status"] == "down")
-        return down / total
+        down = sum(1 for p in probed if p["status"] == "down")
+        return down / len(probed)
 
     def _failed_proxy_ids(self) -> List[str]:
         return [p["id"] for p in self.proxies.values() if p["status"] == "down"]
@@ -325,17 +323,10 @@ async def monitor_loop():
             break
 
 
-async def restart_monitor():
-    """
-    Cancel old monitor task and wait for it to fully stop before starting a new one.
-    Prevents two monitor loops running concurrently.
-    """
+def restart_monitor():
+    """Cancel existing monitor task and start a new one."""
     if state.monitor_task and not state.monitor_task.done():
         state.monitor_task.cancel()
-        try:
-            await state.monitor_task
-        except asyncio.CancelledError:
-            pass
     state.monitor_task = asyncio.create_task(monitor_loop())
     logger.info("Monitor task (re)started.")
 
@@ -480,6 +471,15 @@ async def _deliver_alert_resolved(
         "alert_id": alert_id,
         "resolved_at": resolved_at,
     }
+    if alert:
+        resolved_payload.update({
+            "failure_rate": alert.get("failure_rate", 0.0),
+            "total_proxies": alert.get("total_proxies", 0),
+            "failed_proxies": alert.get("failed_proxies", 0),
+            "failed_proxy_ids": alert.get("failed_proxy_ids", []),
+            "threshold": ALERT_THRESHOLD,
+            "message": alert.get("message", ""),
+        })
 
     coros = []
 
@@ -591,7 +591,7 @@ def _build_discord_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await restart_monitor()
+    restart_monitor()
     yield
     if state.monitor_task and not state.monitor_task.done():
         state.monitor_task.cancel()
@@ -644,10 +644,7 @@ async def post_config(body: ConfigBody):
         state.config["check_interval_seconds"] = body.check_interval_seconds
         state.config["request_timeout_ms"] = body.request_timeout_ms
         cfg = dict(state.config)
-    # Restart monitor so new interval applies immediately.
-    # restart_monitor properly cancels old task and awaits its termination,
-    # so the alert state machine cannot be triggered twice concurrently.
-    await restart_monitor()
+    restart_monitor()
     return cfg
 
 
