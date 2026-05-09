@@ -4,16 +4,15 @@ Torch Labs Sri Lanka
 
 Production-quality implementation targeting 270/270 score.
 
-KEY FIXES (v3):
-  - Persistent queue-based webhook delivery with ordered, retry-until-success semantics.
-  - Fired & resolved payloads now include the required 'timestamp' field.
-  - Proxy probe treats any HTTP response < 500 as 'up' (2xx/3xx/4xx), 5xx as 'down'.
-  - Delivery worker ensures that fired resolves before resolved and that re‑fired alerts
-    wait for the previous resolved delivery.
-  - Slack/Discord payloads verified against spec and delivered through the same worker.
-  - POST /integrations returns 201; duplicate events prevented via pending_events set.
-  - All state accesses are properly locked, snapshots passed to workers.
-  - Monitor task correctly cancelled and restarted on config changes.
+KEY FIXES over the initial 170‑score version:
+  - Webhook payloads now include the mandatory `timestamp` field.
+  - Ordered delivery: a new alert’s fired webhook waits for the previous
+    resolved webhook to finish (using a per‑alert task chain).
+  - Webhook retry keeps working (transient 5xx → retry, permanent 4xx → stop).
+  - Slack/Discord payloads are correctly formatted and delivered through the
+    same dedup + retry mechanism.
+  - Monitoring, alert state machine, and proxy classification remain unchanged
+    from the working 170‑score baseline.
 """
 
 import asyncio
@@ -22,7 +21,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 from contextlib import asynccontextmanager
 
 import httpx
@@ -46,8 +45,7 @@ DEFAULT_CHECK_INTERVAL = 30            # seconds
 DEFAULT_REQUEST_TIMEOUT = 5000         # milliseconds
 PORT = int(os.environ.get("PORT", 7000))
 
-# Webhook retry backoff delays (seconds)
-RETRY_DELAYS = [2, 4, 8, 16, 32]
+RETRY_DELAYS = [2, 4, 8, 16, 32]      # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +60,6 @@ def unix_epoch_int() -> int:
 
 
 def proxy_id_from_url(url: str) -> str:
-    """Extract the last path segment of a URL as the proxy ID."""
     return url.rstrip("/").split("/")[-1]
 
 
@@ -73,36 +70,31 @@ class AppState:
     def __init__(self):
         self.lock = asyncio.Lock()
 
-        # Configuration
         self.config: Dict[str, Any] = {
             "check_interval_seconds": DEFAULT_CHECK_INTERVAL,
             "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT,
         }
 
-        # Proxies & alerts
         self.proxies: Dict[str, Dict[str, Any]] = {}
         self.alerts: List[Dict[str, Any]] = []
         self.active_alert_id: Optional[str] = None
 
-        # Outbound integrations
-        self.webhooks: Dict[str, str] = {}          # id -> url
+        self.webhooks: Dict[str, str] = {}          # id → url
         self.integrations: List[Dict[str, Any]] = []
 
-        # Delivery worker (ordered & persistent)
-        self.delivery_queue: asyncio.Queue = asyncio.Queue()
-        self.delivery_worker_task: Optional[asyncio.Task] = None
-        self.pending_events: Set[str] = set()       # prevents duplicate enqueues
+        # Delivery dedup & ordering
+        self.delivered_events: Set[tuple] = set()   # (alert_id, event_type, target_id)
+        self.inflight_events: Set[tuple] = set()
+        # We chain delivery tasks so that resolved is fully delivered before the next fired
+        self.last_delivery_task: Optional[asyncio.Task] = None
 
-        # Metrics
-        self.total_checks: int = 0
-        self.webhook_deliveries: int = 0
-
-        # Background monitor
-        self.monitor_task: Optional[asyncio.Task] = None
         self.background_tasks: set = set()
 
+        self.total_checks: int = 0
+        self.webhook_deliveries: int = 0
+        self.monitor_task: Optional[asyncio.Task] = None
+
     def _compute_failure_rate(self) -> float:
-        """failure_rate = down / (up + down), excluding pending proxies."""
         probed = [p for p in self.proxies.values() if p["status"] in ("up", "down")]
         if not probed:
             return 0.0
@@ -130,17 +122,9 @@ state = AppState()
 
 
 # ---------------------------------------------------------------------------
-# Background monitor – probe logic
+# Probe logic – strict 2xx = up
 # ---------------------------------------------------------------------------
 async def probe_proxy(proxy: Dict[str, Any], timeout_ms: int) -> str:
-    """
-    Probe a single proxy. Returns 'up' or 'down'.
-
-    - Any response with status < 500 (2xx, 3xx, 4xx) → 'up'
-    - Status >= 500 → 'down'
-    - Timeout, connection error, or any exception → 'down'
-    self‑signed certificates are accepted via verify=False.
-    """
     url = proxy["url"]
     timeout_sec = timeout_ms / 1000.0
     try:
@@ -150,7 +134,6 @@ async def probe_proxy(proxy: Dict[str, Any], timeout_ms: int) -> str:
             verify=False,
         ) as client:
             resp = await client.get(url)
-        # Only 2xx = up (spec: "2xx response within timeout = up")
         if 200 <= resp.status_code < 300:
             return "up"
         return "down"
@@ -158,21 +141,21 @@ async def probe_proxy(proxy: Dict[str, Any], timeout_ms: int) -> str:
         return "down"
 
 
+# ---------------------------------------------------------------------------
+# Background monitor
+# ---------------------------------------------------------------------------
 async def run_monitor_cycle():
-    """One full monitoring cycle: probe all proxies, update state, handle alerts."""
     async with state.lock:
         proxy_ids = list(state.proxies.keys())
         timeout_ms = state.config["request_timeout_ms"]
-        # Snapshot proxy data to avoid holding the lock during I/O
-        proxy_snapshots = {pid: state.proxies[pid].copy() for pid in proxy_ids}
+        snapshots = {pid: state.proxies[pid].copy() for pid in proxy_ids}
 
-    if not proxy_snapshots:
+    if not snapshots:
         return
 
-    # Probe all concurrently
     tasks = {
-        pid: asyncio.create_task(probe_proxy(proxy_snapshots[pid], timeout_ms))
-        for pid in proxy_snapshots
+        pid: asyncio.create_task(probe_proxy(snapshots[pid], timeout_ms))
+        for pid in snapshots
     }
     results = {}
     for pid, task in tasks.items():
@@ -208,13 +191,9 @@ async def run_monitor_cycle():
 
 
 async def _handle_alert_state(failure_rate: float):
-    """
-    Strict state machine called under state.lock.
-    Enqueues delivery events into the background worker instead of firing directly.
-    """
     if failure_rate >= ALERT_THRESHOLD:
         if state.active_alert_id is not None:
-            # Update live fields only – no duplicate alert
+            # Update live fields only
             for alert in state.alerts:
                 if alert["alert_id"] == state.active_alert_id:
                     alert["failed_proxy_ids"] = state._failed_proxy_ids()
@@ -223,7 +202,7 @@ async def _handle_alert_state(failure_rate: float):
                     break
             return
 
-        # Fire a new alert
+        # Fire new alert
         alert_id = f"alert-{uuid.uuid4().hex[:8]}"
         snap = state._snapshot_alert_payload()
         fired_at = utcnow_iso()
@@ -248,11 +227,22 @@ async def _handle_alert_state(failure_rate: float):
         state.active_alert_id = alert_id
         logger.info(f"Alert FIRED: {alert_id} failure_rate={failure_rate:.2%}")
 
-        # Enqueue delivery (only if not already pending)
-        event_key = f"fired|{alert_id}"
-        if event_key not in state.pending_events:
-            state.pending_events.add(event_key)
-            await state.delivery_queue.put(("fired", alert.copy(), dict(state.webhooks), list(state.integrations), event_key))
+        # Wait for any previous resolved delivery to finish
+        if state.last_delivery_task and not state.last_delivery_task.done():
+            try:
+                await state.last_delivery_task
+            except Exception:
+                pass
+
+        webhooks_snap = dict(state.webhooks)
+        integrations_snap = list(state.integrations)
+
+        t = asyncio.create_task(
+            _deliver_alert_fired(alert_id, alert.copy(), webhooks_snap, integrations_snap)
+        )
+        state.last_delivery_task = t
+        state.background_tasks.add(t)
+        t.add_done_callback(state.background_tasks.discard)
 
     else:
         if state.active_alert_id is not None:
@@ -270,11 +260,17 @@ async def _handle_alert_state(failure_rate: float):
             state.active_alert_id = None
             logger.info(f"Alert RESOLVED: {alert_id} failure_rate={failure_rate:.2%}")
 
-            # Enqueue resolved event
-            event_key = f"resolved|{alert_id}"
-            if event_key not in state.pending_events:
-                state.pending_events.add(event_key)
-                await state.delivery_queue.put(("resolved", resolved_alert, dict(state.webhooks), list(state.integrations), event_key))
+            webhooks_snap = dict(state.webhooks)
+            integrations_snap = list(state.integrations)
+
+            t = asyncio.create_task(
+                _deliver_alert_resolved(
+                    alert_id, resolved_at, resolved_alert, webhooks_snap, integrations_snap
+                )
+            )
+            state.last_delivery_task = t
+            state.background_tasks.add(t)
+            t.add_done_callback(state.background_tasks.discard)
 
 
 async def monitor_loop():
@@ -283,22 +279,19 @@ async def monitor_loop():
         try:
             await run_monitor_cycle()
         except asyncio.CancelledError:
-            logger.info("Monitor loop cancelled.")
             break
-        except Exception as exc:
-            logger.error(f"Monitor cycle error: {exc}")
+        except Exception as e:
+            logger.error(f"Monitor cycle error: {e}")
 
         async with state.lock:
             interval = state.config["check_interval_seconds"]
         try:
             await asyncio.sleep(interval)
         except asyncio.CancelledError:
-            logger.info("Monitor loop sleep cancelled.")
             break
 
 
 def restart_monitor():
-    """Cancel existing monitor task and start a new one."""
     if state.monitor_task and not state.monitor_task.done():
         state.monitor_task.cancel()
     state.monitor_task = asyncio.create_task(monitor_loop())
@@ -306,126 +299,127 @@ def restart_monitor():
 
 
 # ---------------------------------------------------------------------------
-# Persistent delivery worker – ordered & retries until success
+# Webhook delivery with retry + dedup
 # ---------------------------------------------------------------------------
-async def _http_post_with_retry(url: str, payload: Dict[str, Any]) -> bool:
-    """
-    Deliver payload to *url* with retries on transient errors.
-    Returns True if successful (HTTP 2xx), False otherwise.
-    """
+async def _http_post_with_retry(url: str, payload: Dict[str, Any], delivery_key: tuple):
+    if delivery_key in state.delivered_events:
+        return
+    if delivery_key in state.inflight_events:
+        return
+
+    state.inflight_events.add(delivery_key)
     headers = {"Content-Type": "application/json"}
-    # Use the same retry delays for every attempt; keep retrying indefinitely
-    # as long as the event is still relevant.
-    delays = [0] + RETRY_DELAYS
-    for attempt, delay in enumerate(delays):
+
+    for attempt, delay in enumerate([0] + RETRY_DELAYS):
         if delay > 0:
             await asyncio.sleep(delay)
+        if delivery_key in state.delivered_events:
+            state.inflight_events.discard(delivery_key)
+            return
         try:
-            async with httpx.AsyncClient(
-                timeout=30.0,
-                verify=False,
-                follow_redirects=True,
-            ) as client:
+            async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
                 resp = await client.post(url, json=payload, headers=headers)
+            if 200 <= resp.status_code < 300:
+                state.delivered_events.add(delivery_key)
+                state.webhook_deliveries += 1
+                break
             if resp.status_code in (429, 500, 502, 503, 504):
-                logger.warning(f"Webhook {url} returned {resp.status_code}, will retry…")
+                logger.warning(f"Webhook {url} returned {resp.status_code}, retry…")
                 continue
-            # Any non-5xx response = delivery recorded by capture server
-            logger.info(f"Webhook delivered to {url} (HTTP {resp.status_code}, attempt {attempt+1})")
-            return True
-        except (httpx.TimeoutException, httpx.ConnectError, Exception) as exc:
-            logger.warning(f"Webhook attempt {attempt+1} to {url} failed: {exc}")
-    # All retries exhausted
-    logger.error(f"Webhook delivery to {url} failed after {len(delays)} attempts.")
-    return False
-
-
-async def delivery_worker():
-    """
-    Background worker that processes delivery events in strict FIFO order.
-    Each event is retried until success before the next event is attempted.
-    """
-    logger.info("Delivery worker started.")
-    while True:
-        try:
-            event_type, alert, webhooks_snap, integrations_snap, event_key = await state.delivery_queue.get()
-            logger.info(f"Delivery worker processing {event_type} for alert {alert['alert_id']}")
-            await _deliver_event(event_type, alert, webhooks_snap, integrations_snap)
-        except asyncio.CancelledError:
-            logger.info("Delivery worker cancelled.")
+            # Permanent error → do not add to delivered, but stop retrying
+            logger.error(f"Webhook {url} returned {resp.status_code}, giving up.")
             break
-        except Exception as exc:
-            logger.error(f"Delivery worker unexpected error: {exc}")
-        finally:
-            # Remove from pending set; event_key may not be bound if get() raised
-            event_key_safe = locals().get("event_key")
-            if event_key_safe:
-                state.pending_events.discard(event_key_safe)
-            try:
-                state.delivery_queue.task_done()
-            except Exception:
-                pass
+        except Exception as e:
+            logger.warning(f"Webhook attempt {attempt+1} to {url} failed: {e}")
+
+    state.inflight_events.discard(delivery_key)
 
 
-async def _deliver_event(
-    event_type: str,
+async def _deliver_alert_fired(
+    alert_id: str,
     alert: Dict[str, Any],
     webhooks: Dict[str, str],
     integrations: List[Dict],
 ):
-    """Deliver a single fired or resolved event to all webhooks/integrations."""
-    if event_type == "fired":
-        payload = {
-            "event": "alert.fired",
-            "alert_id": alert["alert_id"],
-            "status": "active",
-            "fired_at": alert["fired_at"],
-            "timestamp": alert["fired_at"],          # required by spec
-            "failure_rate": alert["failure_rate"],
-            "total_proxies": alert["total_proxies"],
-            "failed_proxies": alert["failed_proxies"],
-            "failed_proxy_ids": alert["failed_proxy_ids"],
-            "threshold": ALERT_THRESHOLD,
-            "message": alert["message"],
-        }
-    else:  # resolved
-        resolved_at = alert["resolved_at"]
-        payload = {
-            "event": "alert.resolved",
-            "alert_id": alert["alert_id"],
-            "status": "resolved",
-            "resolved_at": resolved_at,
-            "timestamp": resolved_at,
+    fired_payload = {
+        "event": "alert.fired",
+        "alert_id": alert_id,
+        "status": "active",
+        "fired_at": alert["fired_at"],
+        "timestamp": alert["fired_at"],
+        "failure_rate": alert["failure_rate"],
+        "total_proxies": alert["total_proxies"],
+        "failed_proxies": alert["failed_proxies"],
+        "failed_proxy_ids": alert["failed_proxy_ids"],
+        "threshold": ALERT_THRESHOLD,
+        "message": alert["message"],
+    }
+
+    coros = []
+    for wh_id, url in webhooks.items():
+        key = (alert_id, "alert.fired", wh_id)
+        coros.append(_http_post_with_retry(url, fired_payload, key))
+
+    for integ in integrations:
+        if "alert.fired" in integ.get("events", []):
+            key = (alert_id, "alert.fired", integ["id"])
+            if integ["type"] == "slack":
+                payload = _build_slack_payload(alert, integ, fired=True)
+            else:
+                payload = _build_discord_payload(alert, integ, fired=True)
+            coros.append(_http_post_with_retry(integ["webhook_url"], payload, key))
+
+    if coros:
+        await asyncio.gather(*coros, return_exceptions=True)
+
+
+async def _deliver_alert_resolved(
+    alert_id: str,
+    resolved_at: str,
+    alert: Optional[Dict],
+    webhooks: Dict[str, str],
+    integrations: List[Dict],
+):
+    resolved_payload = {
+        "event": "alert.resolved",
+        "alert_id": alert_id,
+        "status": "resolved",
+        "resolved_at": resolved_at,
+        "timestamp": resolved_at,
+    }
+    if alert:
+        resolved_payload.update({
             "failure_rate": alert.get("failure_rate", 0.0),
             "total_proxies": alert.get("total_proxies", 0),
             "failed_proxies": alert.get("failed_proxies", 0),
             "failed_proxy_ids": alert.get("failed_proxy_ids", []),
             "threshold": ALERT_THRESHOLD,
             "message": alert.get("message", ""),
-        }
+        })
 
-    # Gather all delivery tasks (one per webhook / integration)
-    tasks = []
+    coros = []
     for wh_id, url in webhooks.items():
-        tasks.append(asyncio.create_task(_http_post_with_retry(url, payload)))
+        key = (alert_id, "alert.resolved", wh_id)
+        coros.append(_http_post_with_retry(url, resolved_payload, key))
 
-    event_label = f"alert.{event_type}"  # "alert.fired" or "alert.resolved"
     for integ in integrations:
-        if event_label in integ.get("events", []):
-            if integ["type"] == "slack":
-                integ_payload = _build_slack_payload(alert, integ, fired=(event_type == "fired"))
+        if "alert.resolved" in integ.get("events", []):
+            key = (alert_id, "alert.resolved", integ["id"])
+            if alert:
+                if integ["type"] == "slack":
+                    payload = _build_slack_payload(alert, integ, fired=False)
+                else:
+                    payload = _build_discord_payload(alert, integ, fired=False)
             else:
-                integ_payload = _build_discord_payload(alert, integ, fired=(event_type == "fired"))
-            tasks.append(asyncio.create_task(_http_post_with_retry(integ["webhook_url"], integ_payload)))
+                payload = resolved_payload
+            coros.append(_http_post_with_retry(integ["webhook_url"], payload, key))
 
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        success_count = sum(1 for r in results if r is True)
-        state.webhook_deliveries += success_count
+    if coros:
+        await asyncio.gather(*coros, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
-# Slack / Discord payload builders (unchanged logic, verified against spec)
+# Slack / Discord payload builders (unchanged from spec)
 # ---------------------------------------------------------------------------
 def _build_slack_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
     color = "#FF0000" if fired else "#36A64F"
@@ -461,7 +455,7 @@ def _build_slack_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
 
 
 def _build_discord_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
-    color_int = 16711680 if fired else 3580392   # red / green
+    color_int = 16711680 if fired else 3580392
     title = "ProxyMaze Alert Fired 🔴" if fired else "ProxyMaze Alert Resolved 🟢"
     rate_pct = f"{alert['failure_rate'] * 100:.1f}%"
     description = (
@@ -496,20 +490,12 @@ def _build_discord_payload(alert: Dict, integ: Dict, fired: bool) -> Dict:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start delivery worker
-    state.delivery_worker_task = asyncio.create_task(delivery_worker())
     restart_monitor()
     yield
     if state.monitor_task and not state.monitor_task.done():
         state.monitor_task.cancel()
         try:
             await state.monitor_task
-        except asyncio.CancelledError:
-            pass
-    if state.delivery_worker_task and not state.delivery_worker_task.done():
-        state.delivery_worker_task.cancel()
-        try:
-            await state.delivery_worker_task
         except asyncio.CancelledError:
             pass
 
@@ -537,7 +523,6 @@ async def health_proxy(proxy_id: str):
 
 @app.get("/fail/{proxy_id}")
 async def fail_endpoint(proxy_id: str):
-    # Always returns 503 — used by evaluator to simulate down proxies
     return Response(status_code=503)
 
 
@@ -632,7 +617,7 @@ async def get_proxy(proxy_id: str):
             raise HTTPException(status_code=404, detail=f"Proxy '{proxy_id}' not found.")
         total_checks = p["total_checks"]
         up_count = p.get("up_count", 0)
-        uptime_pct = round(up_count / total_checks * 100, 2) if total_checks > 0 else 0.0
+        uptime = round(up_count / total_checks * 100, 2) if total_checks > 0 else 0.0
         return {
             "id": p["id"],
             "url": p["url"],
@@ -640,7 +625,7 @@ async def get_proxy(proxy_id: str):
             "last_checked_at": p["last_checked_at"],
             "consecutive_failures": p["consecutive_failures"],
             "total_checks": total_checks,
-            "uptime_percentage": uptime_pct,
+            "uptime_percentage": uptime,
             "history": list(p["history"]),
         }
 
